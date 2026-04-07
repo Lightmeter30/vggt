@@ -147,3 +147,8 @@ skyseg.onnx
 # pixi environments
 .pixi
 *.egg-info
+
+# my configs
+dataset/
+training/logs/
+my_docs/

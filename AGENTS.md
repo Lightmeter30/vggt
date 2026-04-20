@@ -301,3 +301,21 @@ python -m py_compile <你改过的 Python 文件>
 4. 做最小可行修改
 5. 运行 `py_compile` 或最小 smoke test
 6. 明确剩余风险
+
+## 12. 项目设置
+
+这个项目的运行必须使用本地conda环境`my_vggt_relocation`
+
+请勿使用系统解释器运行 Python、pytest、pip 或脚本, 而是使用如下脚本：
+
+- `conda run -n my_vggt_relocation python --version`
+- `conda run -n my_vggt_relocation python main.py`
+- `conda run -n my_vggt_relocation pytest -q`
+- `conda run -n my_vggt_relocation pip install -r requirements.txt`
+
+### 12.1 相关规则
+
+- 请始终使用 `conda run -n my_vggt_relocation ...`，而不是直接使用 `python`、`pip` 或 `pytest`。
+- 在修改 Python 代码之前，请使用 `conda run -n my_vggt_relocation python --version` 验证解释器版本。
+- 如果缺少依赖项，请将其安装到 `my_vggt_relocation` Conda 环境中，而不是全局安装。
+

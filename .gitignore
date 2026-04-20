@@ -152,3 +152,4 @@ skyseg.onnx
 dataset/
 training/logs/
 my_docs/
+.vscode/

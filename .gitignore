@@ -153,3 +153,5 @@ dataset/
 training/logs/
 my_docs/
 .vscode/
+.gradio_tmp/
+evaluation/results/

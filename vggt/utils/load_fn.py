@@ -10,6 +10,22 @@ from torchvision import transforms as TF
 import numpy as np
 
 
+def _as_pil_rgb_image(image_source):
+    """Convert a path, PIL image, or numpy array into an RGB PIL image."""
+    if isinstance(image_source, Image.Image):
+        img = image_source
+    elif isinstance(image_source, np.ndarray):
+        img = Image.fromarray(image_source)
+    else:
+        img = Image.open(image_source)
+
+    if img.mode == "RGBA":
+        background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(background, img)
+
+    return img.convert("RGB")
+
+
 def load_and_preprocess_images_square(image_path_list, target_size=1024):
     """
     Load and preprocess images by center padding to square and resizing to target size.
@@ -37,16 +53,7 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024):
     to_tensor = TF.ToTensor()
 
     for image_path in image_path_list:
-        # Open image
-        img = Image.open(image_path)
-
-        # If there's an alpha channel, blend onto white background
-        if img.mode == "RGBA":
-            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            img = Image.alpha_composite(background, img)
-
-        # Convert to RGB
-        img = img.convert("RGB")
+        img = _as_pil_rgb_image(image_path)
 
         # Get original dimensions
         width, height = img.size
@@ -94,13 +101,13 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024):
     return images, original_coords
 
 
-def load_and_preprocess_images(image_path_list, mode="crop"):
+def _load_and_preprocess_images_impl(image_sources, mode="crop"):
     """
     A quick start function to load and preprocess images for model input.
     This assumes the images should have the same shape for easier batching, but our model can also work well with different shapes.
 
     Args:
-        image_path_list (list): List of paths to image files
+        image_sources (list): List of image paths, PIL images, or numpy arrays
         mode (str, optional): Preprocessing mode, either "crop" or "pad".
                              - "crop" (default): Sets width to 518px and center crops height if needed.
                              - "pad": Preserves all pixels by making the largest dimension 518px
@@ -122,7 +129,7 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
         - Dimensions are adjusted to be divisible by 14 for compatibility with model requirements
     """
     # Check for empty list
-    if len(image_path_list) == 0:
+    if len(image_sources) == 0:
         raise ValueError("At least 1 image is required")
 
     # Validate mode
@@ -135,19 +142,8 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
     target_size = 518
 
     # First process all images and collect their shapes
-    for image_path in image_path_list:
-        # Open image
-        img = Image.open(image_path)
-
-        # If there's an alpha channel, blend onto white background:
-        if img.mode == "RGBA":
-            # Create white background
-            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            # Alpha composite onto the white background
-            img = Image.alpha_composite(background, img)
-
-        # Now convert to "RGB" (this step assigns white for transparent areas)
-        img = img.convert("RGB")
+    for image_source in image_sources:
+        img = _as_pil_rgb_image(image_source)
 
         width, height = img.size
 
@@ -222,9 +218,19 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
     images = torch.stack(images)  # concatenate images
 
     # Ensure correct shape when single image
-    if len(image_path_list) == 1:
+    if len(image_sources) == 1:
         # Verify shape is (1, C, H, W)
         if images.dim() == 3:
             images = images.unsqueeze(0)
 
     return images
+
+
+def load_and_preprocess_images(image_path_list, mode="crop"):
+    """Load and preprocess images from filesystem paths."""
+    return _load_and_preprocess_images_impl(image_path_list, mode=mode)
+
+
+def load_and_preprocess_images_from_objects(image_objects, mode="crop"):
+    """Load and preprocess PIL images or numpy arrays for model input."""
+    return _load_and_preprocess_images_impl(image_objects, mode=mode)

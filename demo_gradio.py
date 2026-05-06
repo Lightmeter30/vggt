@@ -16,6 +16,10 @@ import glob
 import gc
 import time
 
+GRADIO_TEMP_DIR = os.path.abspath(".gradio_tmp")
+os.makedirs(GRADIO_TEMP_DIR, exist_ok=True)
+os.environ.setdefault("GRADIO_TEMP_DIR", GRADIO_TEMP_DIR)
+
 sys.path.append("vggt/")
 
 from visual_util import predictions_to_glb

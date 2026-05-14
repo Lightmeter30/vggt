@@ -19,8 +19,13 @@ from evaluation.datasets.euroc.camera_pose import (
 )
 from evaluation.datasets.realestate10k.camera_pose import (
     evaluate_sequences as evaluate_realestate10k_sequences,
+    load_frame_manifest,
     load_realestate10k_sequence_entries,
     write_metrics_report,
+)
+from training.data.preprocess.generate_local_realestate10k_frames import (
+    find_best_metadata_match,
+    frame_tolerance_us,
 )
 from evaluation.datasets.co3d.camera_pose import (
     evaluate_sequences as evaluate_co3d_sequences,
@@ -244,6 +249,57 @@ class TestRealEstate10KCameraPoseEvaluation(unittest.TestCase):
         self.assertTrue(np.allclose(sequence_entries[0]["frames"][1]["extrinsics"], _make_extrinsic(1.0)))
         self.assertTrue(np.isclose(sequence_entries[0]["frames"][0]["intrinsics_normalized"][0], 0.75))
 
+    def test_load_realestate10k_sequence_entries_rejects_stale_manifest_frames(self):
+        manifest_path = self.dataset_dir / "transcode_manifest.jsonl"
+        manifest_rows = [
+            {
+                "seq_name": "valid",
+                "video_id": "abc123XYZ",
+                "timestamp": "1000",
+                "matched_video_time_us": 1000,
+                "abs_error_us": 0.0,
+                "fps": 30.0,
+                "image_path": str(self.transcode_dir / "abc123XYZ" / "1000.jpg"),
+                "source_video_path": str(self.dataset_dir / "downloaded" / "abc123XYZ"),
+            },
+            {
+                "seq_name": "valid",
+                "video_id": "abc123XYZ",
+                "timestamp": "2000",
+                "matched_video_time_us": 2000,
+                "abs_error_us": 20000.0,
+                "fps": 30.0,
+                "image_path": str(self.transcode_dir / "abc123XYZ" / "2000.jpg"),
+                "source_video_path": str(self.dataset_dir / "downloaded" / "abc123XYZ"),
+            },
+            {
+                "seq_name": "valid",
+                "video_id": "abc123XYZ",
+                "timestamp": "3000",
+                "matched_video_time_us": 3000,
+                "abs_error_us": 0.0,
+                "fps": 30.0,
+                "image_path": str(self.transcode_dir / "abc123XYZ" / "3000.jpg"),
+                "source_video_path": str(self.dataset_dir / "downloaded" / "abc123XYZ"),
+            },
+        ]
+        manifest_path.write_text(
+            "\n".join(json.dumps(row) for row in manifest_rows) + "\n",
+            encoding="utf-8",
+        )
+
+        sequence_entries = load_realestate10k_sequence_entries(
+            realestate10k_dir=self.dataset_dir,
+            split="test",
+            min_num_images=2,
+            frame_manifest=load_frame_manifest(manifest_path),
+            require_frame_manifest=True,
+        )
+
+        self.assertEqual(len(sequence_entries), 1)
+        self.assertEqual([frame["timestamp"] for frame in sequence_entries[0]["frames"]], ["1000", "3000"])
+        self.assertEqual(sequence_entries[0]["frame_filter_stats"]["stale_manifest"], 1)
+
     def test_evaluate_sequences_returns_perfect_metrics_with_gt_predictor(self):
         sequence_entries = load_realestate10k_sequence_entries(
             realestate10k_dir=self.dataset_dir,
@@ -363,6 +419,28 @@ class TestRealEstate10KCameraPoseEvaluation(unittest.TestCase):
         self.assertGreaterEqual(len(sequence_entries[0]["frames"]), 3)
         for frame in sequence_entries[0]["frames"][:3]:
             self.assertTrue(Path(frame["image_path"]).exists())
+
+
+class TestRealEstate10KFrameExtraction(unittest.TestCase):
+    def test_frame_tolerance_uses_microseconds(self):
+        self.assertAlmostEqual(frame_tolerance_us(30.0), 16666.666666666668)
+
+    def test_find_best_metadata_match_returns_one_nearest_frame(self):
+        metadata_frames = [
+            {"timestamp": "30463767"},
+            {"timestamp": "30497133"},
+            {"timestamp": "30530500"},
+        ]
+
+        match, distance = find_best_metadata_match(
+            video_time_us=30497000,
+            metadata_frames=metadata_frames,
+            tolerance_us=frame_tolerance_us(30.0),
+            used_indices=set(),
+        )
+
+        self.assertIs(match, metadata_frames[1])
+        self.assertEqual(distance, 133)
 
 
 class TestCo3DCameraPoseEvaluation(unittest.TestCase):

@@ -26,7 +26,23 @@ conda run -n my_vggt_relocation python evaluation/main.py \
     --euroc_anno_dir /home/zwr/code/my-vggt/dataset/euroc-anno-local
 ```
 
-RealEstate10K 相机位姿评测：
+RealEstate10K 相机位姿评测前，先用仓库内的抽帧脚本生成 `transcode/` 和
+`transcode_manifest.jsonl`：
+
+```bash
+conda run -n my_vggt_relocation python training/data/preprocess/generate_local_realestate10k_frames.py \
+    --realestate10k_dir dataset/realEstate10K \
+    --split test \
+    --overwrite
+```
+
+注意：不要直接复用旧版 `dataset/realEstate10K/downloadAndProcess.py` 或
+`myDownloadAndProcess.py` 生成的 `transcode/`。旧脚本曾使用 `1e9 / (2 * fps)` 作为匹配窗口，
+而 RealEstate10K 的 txt 时间戳单位是微秒；这会把大量 pose 时间戳错误匹配到同一个视频帧，
+导致相机位姿评测的 RTA / AUC 明显偏低。新的抽帧脚本使用 `1e6 / (2 * fps)`，并通过
+manifest 记录每张图的实际视频时间误差。
+
+推荐评测命令：
 
 ```bash
 conda run -n my_vggt_relocation python evaluation/main.py \
@@ -34,9 +50,11 @@ conda run -n my_vggt_relocation python evaluation/main.py \
     --task camera_pose \
     --model_path /home/zwr/code/my-vggt/ckpt/model.pt \
     --realestate10k_dir dataset/realEstate10K \
+    --frame_manifest_path dataset/realEstate10K/transcode_test_manifest.jsonl \
     --split test \
     --fast_eval \
-    --num_frames 10
+    --num_frames 10 \
+    --require_frame_manifest
 ```
 
 Co3D 相机位姿评测：
@@ -72,6 +90,8 @@ RealEstate10K 额外可选参数：
 - `--max_sequences N`
 - `--thresholds 3 5 15 30`
 - `--preprocess_mode crop`
+- `--frame_manifest_path /path/to/transcode_manifest.jsonl`
+- `--require_frame_manifest`
 - `--metrics_output_path /path/to/report.txt`
 - `--metrics_output_dir evaluation/results`
 
@@ -98,6 +118,9 @@ GT 外参直接使用 EuRoC annotation 中的 OpenCV `camera-from-world` `3x4` �
 RealEstate10K 外参直接使用官方 txt 中的 `3x4` camera pose。评测会从首行 YouTube URL 解析
 `video_id`，并读取 `transcode/<video_id>/<timestamp>.jpg`。如果视频已过期或本地没有抽帧结果，
 对应 txt 会被跳过；只有可用帧数不少于 `--min_num_images` 的 sequence 会进入评测。
+如果 `transcode_manifest.jsonl` 存在，评测会自动校验每张图的抽帧时间误差；如果显式传入
+`--require_frame_manifest`，缺少 manifest 或时间误差超过半帧窗口的图片都会被过滤，避免错误图像
+和 pose 配对静默进入指标。
 
 Co3D 外参直接使用
 [training/data/preprocess/generate_local_co3d_annotations.py](/home/zwr/code/my-vggt/training/data/preprocess/generate_local_co3d_annotations.py)

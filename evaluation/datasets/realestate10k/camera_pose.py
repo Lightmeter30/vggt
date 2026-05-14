@@ -1,4 +1,5 @@
 import random
+import json
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -10,6 +11,7 @@ import torch
 from evaluation.common.metrics import calculate_auc_np, se3_to_relative_pose_error
 from vggt.utils.load_fn import load_and_preprocess_images_from_objects
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from training.data.preprocess.generate_local_realestate10k_frames import frame_tolerance_us
 
 
 def add_arguments(parser):
@@ -45,6 +47,18 @@ def add_arguments(parser):
         choices=("crop", "pad"),
         help="VGGT image preprocessing mode.",
     )
+    parser.add_argument(
+        "--frame_manifest_path",
+        type=str,
+        default=None,
+        help="Optional JSONL manifest produced by generate_local_realestate10k_frames.py.",
+    )
+    parser.add_argument(
+        "--require_frame_manifest",
+        action="store_true",
+        default=False,
+        help="Require a valid frame manifest row for every evaluated RealEstate10K frame.",
+    )
 
 
 def _extract_youtube_id(url):
@@ -75,7 +89,58 @@ def _parse_frame_line(line):
     }
 
 
-def _load_sequence_entry(metadata_path, realestate10k_dir, min_num_images):
+def load_frame_manifest(manifest_path):
+    manifest = {}
+    manifest_path = Path(manifest_path)
+    with manifest_path.open("r", encoding="utf-8") as fin:
+        for line_number, line in enumerate(fin, start=1):
+            line = line.strip()
+            if not line:
+                continue
+
+            row = json.loads(line)
+            video_id = row.get("video_id")
+            timestamp = row.get("timestamp")
+            if not video_id or timestamp is None:
+                raise ValueError(f"Invalid manifest row {line_number} in {manifest_path}: missing video_id or timestamp.")
+
+            row["timestamp"] = str(timestamp)
+            manifest[(video_id, str(timestamp))] = row
+    return manifest
+
+
+def _resolve_frame_manifest(realestate10k_dir, frame_manifest_path=None, require_frame_manifest=False):
+    if frame_manifest_path:
+        manifest_path = Path(frame_manifest_path)
+    else:
+        manifest_path = Path(realestate10k_dir) / "transcode_manifest.jsonl"
+        if not manifest_path.is_file():
+            if require_frame_manifest:
+                raise FileNotFoundError(
+                    "RealEstate10K frame manifest is required but was not found: "
+                    f"{manifest_path}. Regenerate frames with "
+                    "training/data/preprocess/generate_local_realestate10k_frames.py."
+                )
+            return None, None
+
+    if not manifest_path.is_file():
+        if require_frame_manifest:
+            raise FileNotFoundError(f"RealEstate10K frame manifest not found: {manifest_path}")
+        return None, None
+    return load_frame_manifest(manifest_path), str(manifest_path)
+
+
+def _manifest_row_is_valid(manifest_row):
+    try:
+        fps = float(manifest_row["fps"])
+        abs_error_us = float(manifest_row["abs_error_us"])
+        tolerance_us = frame_tolerance_us(fps)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return abs_error_us <= tolerance_us
+
+
+def _load_sequence_entry(metadata_path, realestate10k_dir, min_num_images, frame_manifest=None, require_frame_manifest=False):
     lines = Path(metadata_path).read_text(encoding="utf-8").splitlines()
     if not lines:
         return None
@@ -89,6 +154,12 @@ def _load_sequence_entry(metadata_path, realestate10k_dir, min_num_images):
         return None
 
     frames = []
+    frame_filter_stats = {
+        "missing_image": 0,
+        "missing_manifest": 0,
+        "stale_manifest": 0,
+        "kept": 0,
+    }
     for line in lines[1:]:
         parsed_frame = _parse_frame_line(line)
         if parsed_frame is None:
@@ -96,10 +167,30 @@ def _load_sequence_entry(metadata_path, realestate10k_dir, min_num_images):
 
         image_path = image_dir / f"{parsed_frame['timestamp']}.jpg"
         if not image_path.is_file():
+            frame_filter_stats["missing_image"] += 1
+            continue
+
+        manifest_row = None
+        if frame_manifest is not None or require_frame_manifest:
+            manifest_row = (frame_manifest or {}).get((video_id, parsed_frame["timestamp"]))
+            if manifest_row is None:
+                frame_filter_stats["missing_manifest"] += 1
+                continue
+
+            if not _manifest_row_is_valid(manifest_row):
+                frame_filter_stats["stale_manifest"] += 1
+                continue
+
+        if frame_manifest is not None:
+            parsed_frame["frame_manifest"] = manifest_row
+
+        if require_frame_manifest and manifest_row is None:
+            frame_filter_stats["missing_manifest"] += 1
             continue
 
         parsed_frame["image_path"] = str(image_path)
         frames.append(parsed_frame)
+        frame_filter_stats["kept"] += 1
 
     if len(frames) < min_num_images:
         return None
@@ -109,10 +200,17 @@ def _load_sequence_entry(metadata_path, realestate10k_dir, min_num_images):
         "metadata_path": str(metadata_path),
         "video_id": video_id,
         "frames": frames,
+        "frame_filter_stats": frame_filter_stats,
     }
 
 
-def load_realestate10k_sequence_entries(realestate10k_dir, split, min_num_images):
+def load_realestate10k_sequence_entries(
+    realestate10k_dir,
+    split,
+    min_num_images,
+    frame_manifest=None,
+    require_frame_manifest=False,
+):
     realestate10k_dir = Path(realestate10k_dir)
     split_dir = realestate10k_dir / split
     if not split_dir.is_dir():
@@ -124,6 +222,8 @@ def load_realestate10k_sequence_entries(realestate10k_dir, split, min_num_images
             metadata_path=metadata_path,
             realestate10k_dir=realestate10k_dir,
             min_num_images=min_num_images,
+            frame_manifest=frame_manifest,
+            require_frame_manifest=require_frame_manifest,
         )
         if sequence_entry is not None:
             sequence_entries.append(sequence_entry)
@@ -254,10 +354,12 @@ def evaluate_sequences(
     per_sequence = []
     r_errors = []
     t_errors = []
+    skipped_too_short = 0
 
     for sequence_entry in selected_entries:
         min_required_frames = min_num_images if min_num_images is not None else num_frames
         if len(sequence_entry["frames"]) < min_required_frames or len(sequence_entry["frames"]) < num_frames:
+            skipped_too_short += 1
             continue
 
         sampled_indices = np.random.choice(len(sequence_entry["frames"]), num_frames, replace=False)
@@ -275,7 +377,13 @@ def evaluate_sequences(
         r_errors.extend(sequence_result["rError"])
         t_errors.extend(sequence_result["tError"])
 
-    empty_results = {"num_sequences": 0, "per_sequence": per_sequence}
+    frame_filter_stats = _aggregate_frame_filter_stats(selected_entries)
+    empty_results = {
+        "num_sequences": 0,
+        "per_sequence": per_sequence,
+        "skipped_too_short": skipped_too_short,
+        "frame_filter_stats": frame_filter_stats,
+    }
     for threshold in thresholds:
         threshold_key = int(threshold)
         empty_results[f"RRA@{threshold_key}"] = 0.0
@@ -290,9 +398,24 @@ def evaluate_sequences(
     results = {
         "num_sequences": len(per_sequence),
         "per_sequence": per_sequence,
+        "skipped_too_short": skipped_too_short,
+        "frame_filter_stats": frame_filter_stats,
     }
     results.update(_metrics_from_errors(r_errors, t_errors, thresholds))
     return results
+
+
+def _aggregate_frame_filter_stats(sequence_entries):
+    aggregate = {
+        "missing_image": 0,
+        "missing_manifest": 0,
+        "stale_manifest": 0,
+        "kept": 0,
+    }
+    for sequence_entry in sequence_entries:
+        for key, value in sequence_entry.get("frame_filter_stats", {}).items():
+            aggregate[key] = aggregate.get(key, 0) + int(value)
+    return aggregate
 
 
 def _format_threshold_metrics(results, thresholds):
@@ -347,6 +470,12 @@ def write_metrics_report(output_path, results, thresholds, run_config):
             f"num_sequences: {results['num_sequences']}",
         ]
     )
+    if "skipped_too_short" in results:
+        lines.append(f"skipped_too_short: {results['skipped_too_short']}")
+    if "frame_filter_stats" in results:
+        for key in sorted(results["frame_filter_stats"]):
+            lines.append(f"frame_filter_{key}: {results['frame_filter_stats'][key]}")
+
     for threshold in thresholds:
         threshold_key = int(threshold)
         lines.append(f"RRA@{threshold_key}: {results[f'RRA@{threshold_key}']:.4f}")
@@ -382,20 +511,30 @@ def _build_run_config(args):
         "preprocess_mode": args.preprocess_mode,
         "seed": args.seed,
         "model_path": args.model_path,
+        "frame_manifest_path": args.frame_manifest_path,
+        "require_frame_manifest": args.require_frame_manifest,
     }
 
 
 def run(args, model, device, dtype):
+    frame_manifest, resolved_manifest_path = _resolve_frame_manifest(
+        realestate10k_dir=args.realestate10k_dir,
+        frame_manifest_path=args.frame_manifest_path,
+        require_frame_manifest=args.require_frame_manifest,
+    )
     sequence_entries = load_realestate10k_sequence_entries(
         realestate10k_dir=args.realestate10k_dir,
         split=args.split,
         min_num_images=1,
+        frame_manifest=frame_manifest,
+        require_frame_manifest=args.require_frame_manifest,
     )
 
     if not sequence_entries:
         raise RuntimeError(
             "No valid RealEstate10K sequences found. "
-            "Check that transcode/<youtube_id>/<timestamp>.jpg exists for the selected split."
+            "Check that transcode/<youtube_id>/<timestamp>.jpg exists for the selected split "
+            "and that the frame manifest is valid when --require_frame_manifest is set."
         )
 
     results = evaluate_sequences(
@@ -423,6 +562,12 @@ def run(args, model, device, dtype):
         f"{results['num_sequences']} sequences, "
         f"{_format_threshold_metrics(results, args.thresholds)}"
     )
+    if resolved_manifest_path is not None:
+        print(f"Using frame manifest: {resolved_manifest_path}")
+    print(
+        "RealEstate10K frame filters: "
+        f"{results['frame_filter_stats']}, skipped_too_short={results['skipped_too_short']}"
+    )
 
     metrics_output_path = _resolve_metrics_output_path(
         metrics_output_path=args.metrics_output_path,
@@ -432,7 +577,7 @@ def run(args, model, device, dtype):
         output_path=metrics_output_path,
         results=results,
         thresholds=tuple(args.thresholds),
-        run_config=_build_run_config(args),
+        run_config={**_build_run_config(args), "resolved_frame_manifest_path": resolved_manifest_path},
     )
     print(f"Metrics report written to: {metrics_output_path}")
     return results

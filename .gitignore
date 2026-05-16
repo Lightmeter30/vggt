@@ -155,3 +155,6 @@ my_docs/
 .vscode/
 .gradio_tmp/
 evaluation/results/
+outputs/
+prompts/
+repomix-output.xml

@@ -1,4 +1,5 @@
 import gzip
+import argparse
 import json
 import tempfile
 import unittest
@@ -18,9 +19,15 @@ from evaluation.datasets.euroc.camera_pose import (
     load_euroc_sequence_entries,
 )
 from evaluation.datasets.realestate10k.camera_pose import (
+    add_arguments as add_realestate10k_arguments,
+    _build_sampled_indices_by_seq,
+    _merge_sequence_results,
+    _select_sequence_entries_for_evaluation,
+    _shard_sequence_entries,
     evaluate_sequences as evaluate_realestate10k_sequences,
     load_frame_manifest,
     load_realestate10k_sequence_entries,
+    load_sequence_list,
     write_metrics_report,
 )
 from training.data.preprocess.generate_local_realestate10k_frames import (
@@ -30,6 +37,12 @@ from training.data.preprocess.generate_local_realestate10k_frames import (
 from evaluation.datasets.co3d.camera_pose import (
     evaluate_sequences as evaluate_co3d_sequences,
     load_co3d_sequence_entries,
+)
+from evaluation.datasets.realx3d.camera_pose import (
+    _align_sim3,
+    _build_realx3d_tasks,
+    _load_realx3d_sequence,
+    add_arguments as add_realx3d_arguments,
 )
 
 
@@ -300,6 +313,54 @@ class TestRealEstate10KCameraPoseEvaluation(unittest.TestCase):
         self.assertEqual([frame["timestamp"] for frame in sequence_entries[0]["frames"]], ["1000", "3000"])
         self.assertEqual(sequence_entries[0]["frame_filter_stats"]["stale_manifest"], 1)
 
+    def test_load_sequence_list_filters_realestate10k_subset_by_metadata_stem(self):
+        self._write_realestate10k_txt(
+            self.split_dir / "pose_diffusion_subset.txt",
+            video_id="subsetVIDEO",
+            frame_timestamps=["1000", "2000", "3000"],
+            tx_values=[0.0, 1.0, 2.0],
+        )
+        for idx, timestamp in enumerate(["1000", "2000", "3000"]):
+            _write_image(self.transcode_dir / "subsetVIDEO" / f"{timestamp}.jpg", color=(idx * 30, 70, 90))
+
+        sequence_list_path = self.dataset_dir / "re10k_test_1800.txt"
+        sequence_list_path.write_text(
+            "\n".join(["pose_diffusion_subset", "", "missing_sequence", "pose_diffusion_subset"]) + "\n",
+            encoding="utf-8",
+        )
+        sequence_list = load_sequence_list(sequence_list_path)
+
+        sequence_entries = load_realestate10k_sequence_entries(
+            realestate10k_dir=self.dataset_dir,
+            split="test",
+            min_num_images=2,
+            sequence_list=sequence_list,
+        )
+
+        self.assertEqual(sequence_list["requested"], 3)
+        self.assertEqual(sequence_list["unique"], 2)
+        self.assertEqual(sequence_list["duplicates"], 1)
+        self.assertEqual([entry["seq_name"] for entry in sequence_entries], ["pose_diffusion_subset"])
+        self.assertEqual(sequence_entries[0]["video_id"], "subsetVIDEO")
+
+    def test_realestate10k_preprocess_mode_cli_defaults_to_crop_and_accepts_pad(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--model_path", default="model.pt")
+        parser.add_argument("--seed", type=int, default=0)
+        add_realestate10k_arguments(parser)
+
+        default_args = parser.parse_args(["--realestate10k_dir", str(self.dataset_dir)])
+        pad_args = parser.parse_args(
+            ["--realestate10k_dir", str(self.dataset_dir), "--preprocess_mode", "pad"]
+        )
+        gpu_args = parser.parse_args(
+            ["--realestate10k_dir", str(self.dataset_dir), "--gpu_ids", "4", "5"]
+        )
+
+        self.assertEqual(default_args.preprocess_mode, "crop")
+        self.assertEqual(pad_args.preprocess_mode, "pad")
+        self.assertEqual(gpu_args.gpu_ids, [4, 5])
+
     def test_evaluate_sequences_returns_perfect_metrics_with_gt_predictor(self):
         sequence_entries = load_realestate10k_sequence_entries(
             realestate10k_dir=self.dataset_dir,
@@ -368,6 +429,73 @@ class TestRealEstate10KCameraPoseEvaluation(unittest.TestCase):
 
         self.assertEqual(result["num_sequences"], 0)
 
+    def test_select_sequence_entries_builds_reproducible_sample_indices(self):
+        sequence_entries = [
+            {
+                "seq_name": f"seq{idx:02d}",
+                "video_id": f"video{idx:02d}",
+                "frames": [{"image_path": "unused", "extrinsics": _make_extrinsic(float(frame_idx))} for frame_idx in range(5)],
+            }
+            for idx in range(4)
+        ]
+
+        selected_entries, skipped_too_short = _select_sequence_entries_for_evaluation(
+            sequence_entries=sequence_entries,
+            num_frames=3,
+            fast_eval=False,
+            max_sequences=None,
+            seed=7,
+            min_num_images=3,
+        )
+        sampled_a = _build_sampled_indices_by_seq(selected_entries, num_frames=3, seed=7)
+        sampled_b = _build_sampled_indices_by_seq(selected_entries, num_frames=3, seed=7)
+
+        self.assertEqual(skipped_too_short, 0)
+        self.assertEqual([entry["seq_name"] for entry in selected_entries], ["seq00", "seq01", "seq02", "seq03"])
+        self.assertEqual({key: value.tolist() for key, value in sampled_a.items()}, {key: value.tolist() for key, value in sampled_b.items()})
+        for indices in sampled_a.values():
+            self.assertEqual(len(indices), 3)
+            self.assertEqual(len(set(indices.tolist())), 3)
+
+    def test_shard_sequence_entries_assigns_round_robin_workers(self):
+        sequence_entries = [{"seq_name": f"seq{idx}", "frames": []} for idx in range(7)]
+
+        shards = _shard_sequence_entries(sequence_entries, num_shards=3)
+
+        self.assertEqual([[entry["seq_name"] for entry in shard] for shard in shards], [["seq0", "seq3", "seq6"], ["seq1", "seq4"], ["seq2", "seq5"]])
+
+    def test_merge_sequence_results_recomputes_global_metrics(self):
+        per_sequence = [
+            {
+                "seq_name": "b",
+                "video_id": "video_b",
+                "frame_indices": [0, 1],
+                "rError": np.asarray([1.0, 2.0]),
+                "tError": np.asarray([3.0, 4.0]),
+            },
+            {
+                "seq_name": "a",
+                "video_id": "video_a",
+                "frame_indices": [0, 1],
+                "rError": np.asarray([10.0]),
+                "tError": np.asarray([20.0]),
+            },
+        ]
+
+        results = _merge_sequence_results(
+            per_sequence=per_sequence,
+            skipped_too_short=2,
+            frame_filter_stats={"kept": 5, "missing_image": 1, "missing_manifest": 0, "stale_manifest": 0},
+            thresholds=(5, 30),
+        )
+
+        self.assertEqual(results["num_sequences"], 2)
+        self.assertEqual([item["seq_name"] for item in results["per_sequence"]], ["a", "b"])
+        self.assertAlmostEqual(results["RRA@5"], 2 / 3)
+        self.assertAlmostEqual(results["RTA@5"], 2 / 3)
+        expected_auc30, _ = calculate_auc_np(np.asarray([10.0, 1.0, 2.0]), np.asarray([20.0, 3.0, 4.0]), max_threshold=30)
+        self.assertAlmostEqual(results["AUC@30"], expected_auc30)
+
     def test_write_metrics_report_records_summary_and_per_sequence_metrics(self):
         output_path = self.root / "metrics.txt"
         results = {
@@ -387,6 +515,14 @@ class TestRealEstate10KCameraPoseEvaluation(unittest.TestCase):
                     "AUC@3": 0.5,
                 }
             ],
+            "sequence_list_stats": {
+                "path": "dataset/realEstate10K/re10k_test_1800.txt",
+                "requested": 1831,
+                "unique": 1831,
+                "matched": 1800,
+                "missing": 31,
+                "duplicates": 0,
+            },
         }
 
         write_metrics_report(
@@ -403,6 +539,9 @@ class TestRealEstate10KCameraPoseEvaluation(unittest.TestCase):
         self.assertIn("RRA@3: 1.0000", report)
         self.assertIn("RTA@3: 0.5000", report)
         self.assertIn("AUC@3: 0.7500", report)
+        self.assertIn("sequence_list_path: dataset/realEstate10K/re10k_test_1800.txt", report)
+        self.assertIn("sequence_list_requested: 1831", report)
+        self.assertIn("sequence_list_missing: 31", report)
         self.assertIn("valid (abc123XYZ)", report)
         self.assertIn("frame_indices: [0, 1, 2]", report)
         self.assertIn("mean_t_error_deg: 10.0000", report)
@@ -540,6 +679,136 @@ class TestCo3DCameraPoseEvaluation(unittest.TestCase):
             self.assertAlmostEqual(result[f"RRA@{threshold}"], 1.0)
             self.assertAlmostEqual(result[f"RTA@{threshold}"], 1.0)
             self.assertAlmostEqual(result[f"AUC@{threshold}"], 1.0)
+
+
+class TestRealX3DCameraPoseEvaluation(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.data_root = self.root / "RealX3D" / "data_4"
+        self.scene_dir = self.data_root / "motion_mild" / "Chocolate"
+        for split in ("train", "val", "test"):
+            for idx in range(3):
+                _write_image(self.scene_dir / split / f"{idx + 1:04d}.JPG", color=(idx * 40, 20, 60))
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_load_realx3d_sequence_converts_blender_c2w_to_opencv_c2w(self):
+        angle = np.deg2rad(30.0)
+        blender_c2w = np.eye(4, dtype=np.float64)
+        blender_c2w[:3, :3] = np.array(
+            [
+                [np.cos(angle), -np.sin(angle), 0.0],
+                [np.sin(angle), np.cos(angle), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        blender_c2w[:3, 3] = [1.0, 2.0, 3.0]
+
+        payload = {
+            "fl_x": 40.0,
+            "fl_y": 40.0,
+            "cx": 16.0,
+            "cy": 16.0,
+            "w": 32.0,
+            "h": 32.0,
+            "frames": [
+                {"file_path": "test/0001.JPG", "transform_matrix": blender_c2w.tolist()},
+            ],
+        }
+        with open(self.scene_dir / "transforms_test.json", "w", encoding="utf-8") as fout:
+            json.dump(payload, fout)
+
+        sequence = _load_realx3d_sequence(self.data_root, "motion_mild", "Chocolate", "test")
+
+        blender_to_opencv = np.diag([1.0, -1.0, -1.0, 1.0])
+        expected = blender_to_opencv @ blender_c2w @ blender_to_opencv
+        self.assertTrue(np.allclose(sequence["gt_c2w"][0], expected))
+
+    def test_default_splits_are_train_and_val(self):
+        parser = argparse.ArgumentParser()
+        add_realx3d_arguments(parser)
+
+        args = parser.parse_args(["--data_root", str(self.data_root)])
+
+        self.assertEqual(args.splits, ["train", "val"])
+
+    def test_train_val_tasks_add_paired_clean_condition_from_val(self):
+        def make_payload(split: str, names: list[str]) -> dict:
+            return {
+                "fl_x": 40.0,
+                "fl_y": 40.0,
+                "cx": 16.0,
+                "cy": 16.0,
+                "w": 32.0,
+                "h": 32.0,
+                "frames": [
+                    {
+                        "file_path": f"{split}/{name}",
+                        "transform_matrix": np.eye(4, dtype=np.float64).tolist(),
+                    }
+                    for name in names
+                ],
+            }
+
+        train_names = ["0001.JPG", "0002.JPG", "0003.JPG"]
+        val_names = ["0001.JPG", "0002.JPG", "0003.JPG"]
+        with open(self.scene_dir / "transforms_train.json", "w", encoding="utf-8") as fout:
+            json.dump(make_payload("train", train_names), fout)
+        with open(self.scene_dir / "transforms_val.json", "w", encoding="utf-8") as fout:
+            json.dump(make_payload("val", val_names), fout)
+
+        tasks, skipped = _build_realx3d_tasks(
+            data_root=self.data_root,
+            conditions=["motion_mild"],
+            scenes=["Chocolate"],
+            splits=["train", "val"],
+            max_frames=2,
+        )
+
+        self.assertEqual(skipped, [])
+        self.assertEqual(len(tasks), 2)
+        self.assertEqual(tasks[0]["condition"], "motion_mild")
+        self.assertEqual(tasks[0]["split"], "train")
+        self.assertEqual(tasks[0]["frame_names"], None)
+        self.assertEqual(tasks[1]["condition"], "clean")
+        self.assertEqual(tasks[1]["output_condition"], "motion_mild_clean")
+        self.assertEqual(tasks[1]["data_condition"], "motion_mild")
+        self.assertEqual(tasks[1]["split"], "val")
+        self.assertEqual(tasks[1]["frame_names"], ["0001.JPG", "0002.JPG"])
+
+    def test_align_sim3_maps_predicted_centers_to_gt_centers(self):
+        pred = np.repeat(np.eye(4, dtype=np.float64)[None], 4, axis=0)
+        pred[:, :3, 3] = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.5],
+            ]
+        )
+
+        angle = np.deg2rad(40.0)
+        r_align = np.array(
+            [
+                [np.cos(angle), -np.sin(angle), 0.0],
+                [np.sin(angle), np.cos(angle), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        scale = 2.5
+        translation = np.array([3.0, -1.0, 0.25])
+
+        gt = np.repeat(np.eye(4, dtype=np.float64)[None], 4, axis=0)
+        gt[:, :3, :3] = r_align @ pred[:, :3, :3]
+        gt[:, :3, 3] = scale * (r_align @ pred[:, :3, 3].T).T + translation
+
+        aligned, alignment = _align_sim3(pred, gt)
+
+        self.assertTrue(np.allclose(aligned[:, :3, 3], gt[:, :3, 3], atol=1e-8))
+        self.assertTrue(np.allclose(aligned[:, :3, :3], gt[:, :3, :3], atol=1e-8))
+        self.assertAlmostEqual(alignment["s"], scale)
 
 
 if __name__ == "__main__":

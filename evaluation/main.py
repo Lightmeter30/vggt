@@ -39,10 +39,16 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     set_random_seeds(args.seed)
-    device = resolve_device(args.device)
-    dtype = resolve_inference_dtype(device)
-    model = load_model(device, args.model_path)
     evaluator = get_evaluator(args.dataset, args.task)
+    should_load_model = getattr(evaluator, "should_load_model", lambda parsed_args: True)
+    if should_load_model(args):
+        device = resolve_device(args.device)
+        dtype = resolve_inference_dtype(device)
+        model = load_model(device, args.model_path)
+    else:
+        device = None
+        dtype = None
+        model = None
     evaluator.run(args, model=model, device=device, dtype=dtype)
 
 

@@ -35,20 +35,6 @@ def discover_sequences(euroc_dir: Path) -> List[Path]:
     return sorted(set(sequence_dirs))
 
 
-def split_sequences(
-    sequence_dirs: Sequence[Path], train_split_ratio: float
-) -> Tuple[List[Path], List[Path]]:
-    if not sequence_dirs:
-        return [], []
-
-    if len(sequence_dirs) == 1:
-        return list(sequence_dirs), []
-
-    split_idx = int(round(len(sequence_dirs) * train_split_ratio))
-    split_idx = min(max(split_idx, 1), len(sequence_dirs) - 1)
-    return list(sequence_dirs[:split_idx]), list(sequence_dirs[split_idx:])
-
-
 def load_camera_sensor(
     sensor_yaml_path: Path,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -254,7 +240,7 @@ def build_camera_annotation(
                 "gt_timestamp_ns": int(gt_timestamps[gt_index]),
                 "pose_dt_ns": int(pose_dt),
                 "image_rel_path": image_path.relative_to(euroc_dir).as_posix(),
-                "extrinsics": camera_from_world.tolist(),
+                "extrinsics_w2c": camera_from_world.tolist(),
             }
         )
         stats["matched_frames"] += 1
@@ -330,25 +316,33 @@ def build_split_annotations(
     return outputs, stats
 
 
+def sequence_output_stem(euroc_dir: Path, sequence_dir: Path) -> str:
+    return sequence_dir.relative_to(euroc_dir).as_posix().replace("/", "__")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate local EuRoC annotations compatible with VGGT training."
+        description="Generate local EuRoC/ASL annotations compatible with VGGT training."
     )
     parser.add_argument("--euroc_dir", required=True, help="Path to local EuRoC root.")
     parser.add_argument(
         "--output_dir", required=True, help="Directory to write generated *.jgz files."
     )
     parser.add_argument(
+        "--dataset_format",
+        choices=["asl"],
+        default="asl",
+        help=(
+            "Input dataset layout. 'asl' expects EuRoC MAV/ASL format with "
+            "sequence/mav0/cam*/data.csv, sensor.yaml, and "
+            "state_groundtruth_estimate0/data.csv."
+        ),
+    )
+    parser.add_argument(
         "--camera_names",
         nargs="+",
         default=["cam0"],
         help="Camera names to export, e.g. cam0 cam1.",
-    )
-    parser.add_argument(
-        "--train_split_ratio",
-        type=float,
-        default=0.8,
-        help="Fraction of sorted sequences assigned to train split.",
     )
     parser.add_argument(
         "--max_pose_time_diff_ns",
@@ -363,45 +357,52 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     sequence_dirs = discover_sequences(euroc_dir)
-    train_sequences, test_sequences = split_sequences(
-        sequence_dirs, args.train_split_ratio
-    )
 
-    train_payload, train_stats = build_split_annotations(
-        euroc_dir=euroc_dir,
-        sequence_dirs=train_sequences,
-        camera_names=args.camera_names,
-        max_pose_time_diff_ns=args.max_pose_time_diff_ns,
-    )
-    test_payload, test_stats = build_split_annotations(
-        euroc_dir=euroc_dir,
-        sequence_dirs=test_sequences,
-        camera_names=args.camera_names,
-        max_pose_time_diff_ns=args.max_pose_time_diff_ns,
-    )
+    total_stats = {
+        "sequences": 0,
+        "camera_entries": 0,
+        "matched_frames": 0,
+        "missing_images": 0,
+        "pose_gap_skipped": 0,
+    }
+    generated_files = []
+    per_sequence_stats = {}
+    for sequence_dir in sequence_dirs:
+        sequence_payload, sequence_stats = build_split_annotations(
+            euroc_dir=euroc_dir,
+            sequence_dirs=[sequence_dir],
+            camera_names=args.camera_names,
+            max_pose_time_diff_ns=args.max_pose_time_diff_ns,
+        )
+        output_name = f"{sequence_output_stem(euroc_dir, sequence_dir)}.jgz"
+        dump_jgz(output_dir / output_name, sequence_payload)
+        generated_files.append(output_name)
 
-    dump_jgz(output_dir / "euroc_train.jgz", train_payload)
-    dump_jgz(output_dir / "euroc_test.jgz", test_payload)
+        sequence_key = sequence_dir.relative_to(euroc_dir).as_posix()
+        per_sequence_stats[sequence_key] = {
+            "file": output_name,
+            "stats": sequence_stats,
+        }
+        for key in total_stats:
+            total_stats[key] += sequence_stats[key]
 
     summary = {
+        "dataset_format": args.dataset_format,
         "camera_names": list(args.camera_names),
-        "train_split_ratio": args.train_split_ratio,
         "max_pose_time_diff_ns": args.max_pose_time_diff_ns,
         "sequence_dirs": [p.relative_to(euroc_dir).as_posix() for p in sequence_dirs],
-        "train": train_stats,
-        "test": test_stats,
+        "generated_files": generated_files,
+        "total": total_stats,
+        "per_sequence": per_sequence_stats,
     }
     with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
     print(f"Generated annotations under: {output_dir}")
     print(f"Discovered sequences: {len(sequence_dirs)}")
-    print(f"Train camera entries: {train_stats['camera_entries']}")
-    print(f"Test camera entries: {test_stats['camera_entries']}")
-    print(
-        "Matched frames:",
-        train_stats["matched_frames"] + test_stats["matched_frames"],
-    )
+    print(f"Generated sequence files: {len(generated_files)}")
+    print(f"Camera entries: {total_stats['camera_entries']}")
+    print(f"Matched frames: {total_stats['matched_frames']}")
 
 
 if __name__ == "__main__":

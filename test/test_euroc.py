@@ -1,21 +1,27 @@
 from pathlib import Path
 from types import SimpleNamespace
 import csv
+import json
 import sys
 import tempfile
 import unittest
 
 import cv2
 import numpy as np
+from torch.utils.data._utils.collate import default_collate
 import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TRAINING_ROOT = REPO_ROOT / "training"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(TRAINING_ROOT) not in sys.path:
     sys.path.insert(0, str(TRAINING_ROOT))
 
 from data.datasets.euroc import EurocDataset
+from data.composed_dataset import ComposedDataset
+from training.data.preprocess import generate_euroc_annotations as gen_euroc
 
 
 def _make_common_conf():
@@ -31,6 +37,33 @@ def _make_common_conf():
         get_nearby=False,
         inside_random=False,
         allow_duplicate_img=False,
+    )
+
+
+def _make_composed_common_conf():
+    return SimpleNamespace(
+        img_size=32,
+        patch_size=8,
+        fix_img_num=-1,
+        fix_aspect_ratio=1.0,
+        load_track=False,
+        track_num=16,
+        training=False,
+        inside_random=False,
+        rescale=True,
+        rescale_aug=False,
+        landscape_check=False,
+        debug=False,
+        get_nearby=False,
+        allow_duplicate_img=False,
+        augs=SimpleNamespace(
+            scales=None,
+            cojitter=False,
+            cojitter_ratio=0.0,
+            color_jitter=None,
+            gray_scale=False,
+            gau_blur=False,
+        ),
     )
 
 
@@ -177,6 +210,20 @@ class TestEurocDataset(unittest.TestCase):
         _write_csv(invalid_root / "data.csv", ["#timestamp [ns]", "filename"], [[1, "1.png"]])
 
         self.common_conf = _make_common_conf()
+        self.annotation_dir = self.synthetic_euroc_root / "anno"
+        self.annotation_dir.mkdir(parents=True, exist_ok=True)
+        annotation, _ = gen_euroc.build_split_annotations(
+            euroc_dir=self.synthetic_euroc_root,
+            sequence_dirs=gen_euroc.discover_sequences(self.synthetic_euroc_root),
+            camera_names=("cam0", "cam1"),
+            max_pose_time_diff_ns=10_000_000,
+        )
+        gen_euroc.write_split_outputs(
+            output_dir=self.annotation_dir,
+            annotation=annotation,
+            camera_names=("cam0", "cam1"),
+            max_pose_time_diff_ns=10_000_000,
+        )
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -186,76 +233,76 @@ class TestEurocDataset(unittest.TestCase):
             common_conf=self.common_conf,
             split="train",
             EUROC_DIR=str(self.synthetic_euroc_root),
+            EUROC_ANNOTATION_DIR=str(self.annotation_dir),
             min_num_images=2,
-            train_split_ratio=2 / 3,
+            camera_names=("cam0",),
             undistort_images=False,
         )
-        test_dataset = EurocDataset(
+        val_dataset = EurocDataset(
             common_conf=self.common_conf,
-            split="test",
+            split="val",
             EUROC_DIR=str(self.synthetic_euroc_root),
+            EUROC_ANNOTATION_DIR=str(self.annotation_dir),
             min_num_images=2,
-            train_split_ratio=2 / 3,
+            camera_names=("cam0",),
             undistort_images=False,
         )
 
         self.assertEqual(
             train_dataset.sequence_list,
-            ["machine_hall/MH_01_easy", "machine_hall/MH_02_easy"],
+            ["euroc/MH_01_easy/cam0", "euroc/MH_02_easy/cam0"],
         )
-        self.assertEqual(test_dataset.sequence_list, ["vicon_room1/V1_01_easy"])
+        self.assertEqual(val_dataset.sequence_list, ["euroc/V1_01_easy/cam0"])
         self.assertEqual(train_dataset.total_frame_num, 6)
-        self.assertEqual(test_dataset.total_frame_num, 3)
+        self.assertEqual(val_dataset.total_frame_num, 3)
 
-    def test_helper_loaders_and_timestamp_matching(self):
+    def test_deserializes_vi_schema_sensor_frames_and_imu(self):
         dataset = EurocDataset(
             common_conf=self.common_conf,
             split="train",
             EUROC_DIR=str(self.synthetic_euroc_root),
+            EUROC_ANNOTATION_DIR=str(self.annotation_dir),
             min_num_images=2,
-            train_split_ratio=1.0,
+            camera_names=("cam0",),
             undistort_images=False,
         )
 
-        seq_root = self.synthetic_euroc_root / "machine_hall" / "MH_01_easy" / "mav0"
-        intrinsics, distortion, body_from_camera = dataset._load_camera_sensor(seq_root / "cam0" / "sensor.yaml")
-        gt_timestamps, world_from_body = dataset._load_groundtruth(seq_root / "state_groundtruth_estimate0" / "data.csv")
-        imu_data = dataset._load_imu_data(seq_root / "imu0" / "data.csv")
-        nearest_idx, nearest_dt = dataset._find_nearest_timestamp(gt_timestamps, gt_timestamps[1] + 1)
+        sequence = dataset.data_store["euroc/MH_01_easy/cam0"]
+        sensor = sequence["sensor"]
+        frames = sequence["frames"]
+        imu_data = sequence["imu_data"]
 
-        self.assertEqual(intrinsics.shape, (3, 3))
-        self.assertTrue(np.allclose(intrinsics[0, 0], 40.0))
-        self.assertEqual(distortion.shape, (4,))
-        self.assertTrue(np.allclose(body_from_camera, np.eye(4)))
+        self.assertEqual(sequence["dataset"], "euroc")
+        self.assertEqual(sequence["sequence_name"], "MH_01_easy")
+        self.assertEqual(sequence["split"], "train")
 
-        self.assertEqual(gt_timestamps.shape, (3,))
-        self.assertEqual(world_from_body.shape, (3, 4, 4))
-        self.assertTrue(np.allclose(world_from_body[0], np.eye(4)))
-        self.assertTrue(np.isclose(world_from_body[1, 0, 3], 1.0))
+        self.assertEqual(sensor["intrinsics"].shape, (3, 3))
+        self.assertTrue(np.allclose(sensor["intrinsics"][0, 0], 40.0))
+        self.assertEqual(sensor["distortion"].shape, (4,))
+        self.assertEqual(len(frames), 3)
+        self.assertEqual(frames[1]["extrinsics"].shape, (3, 4))
+        self.assertTrue(np.isclose(frames[1]["extrinsics"][0, 3], -1.0))
 
         self.assertEqual(imu_data["timestamps_ns"].ndim, 1)
         self.assertEqual(imu_data["gyro"].shape[1], 3)
         self.assertEqual(imu_data["accel"].shape[1], 3)
-
-        self.assertEqual(nearest_idx, 1)
-        self.assertEqual(nearest_dt, 1)
 
     def test_multi_camera_sequences_and_frame_entries(self):
         dataset = EurocDataset(
             common_conf=self.common_conf,
             split="train",
             EUROC_DIR=str(self.synthetic_euroc_root),
+            EUROC_ANNOTATION_DIR=str(self.annotation_dir),
             min_num_images=2,
-            train_split_ratio=1.0,
             camera_names=("cam0", "cam1"),
             undistort_images=False,
         )
 
-        self.assertIn("machine_hall/MH_01_easy:cam0", dataset.sequence_list)
-        self.assertIn("machine_hall/MH_01_easy:cam1", dataset.sequence_list)
+        self.assertIn("euroc/MH_01_easy/cam0", dataset.sequence_list)
+        self.assertIn("euroc/MH_01_easy/cam1", dataset.sequence_list)
 
-        cam0_frames = dataset.data_store["machine_hall/MH_01_easy:cam0"]["frames"]
-        cam1_frames = dataset.data_store["machine_hall/MH_01_easy:cam1"]["frames"]
+        cam0_frames = dataset.data_store["euroc/MH_01_easy/cam0"]["frames"]
+        cam1_frames = dataset.data_store["euroc/MH_01_easy/cam1"]["frames"]
 
         self.assertEqual(len(cam0_frames), 3)
         self.assertEqual(len(cam1_frames), 3)
@@ -274,20 +321,23 @@ class TestEurocDataset(unittest.TestCase):
             common_conf=self.common_conf,
             split="train",
             EUROC_DIR=str(self.synthetic_euroc_root),
+            EUROC_ANNOTATION_DIR=str(self.annotation_dir),
             min_num_images=2,
-            train_split_ratio=1.0,
+            camera_names=("cam0",),
             load_imu=True,
+            imu_window_ns=20_000_000,
+            imu_num_samples=5,
             undistort_images=False,
         )
 
         batch = dataset.get_data(
-            seq_name="machine_hall/MH_01_easy",
+            seq_name="euroc/MH_01_easy/cam0",
             ids=np.array([0, 1]),
             img_per_seq=2,
             aspect_ratio=1.0,
         )
 
-        self.assertEqual(batch["seq_name"], "euroc_machine_hall/MH_01_easy")
+        self.assertEqual(batch["seq_name"], "euroc_euroc/MH_01_easy/cam0")
         self.assertEqual(batch["frame_num"], 2)
         self.assertEqual(batch["ids"].tolist(), [0, 1])
 
@@ -304,6 +354,8 @@ class TestEurocDataset(unittest.TestCase):
             "point_masks",
             "original_sizes",
             "imu_windows",
+            "imu_window_masks",
+            "timestamps_ns",
         }
         self.assertEqual(set(batch.keys()), expected_keys)
 
@@ -319,10 +371,154 @@ class TestEurocDataset(unittest.TestCase):
         self.assertEqual(int(np.count_nonzero(batch["depths"][0])), 1)
         self.assertEqual(int(batch["point_masks"][0].sum()), 1)
 
-        self.assertEqual(len(batch["imu_windows"]), 2)
-        self.assertGreater(len(batch["imu_windows"][0]["timestamps_ns"]), 0)
-        self.assertEqual(batch["imu_windows"][0]["gyro"].shape[1], 3)
-        self.assertEqual(batch["imu_windows"][0]["accel"].shape[1], 3)
+        self.assertEqual(batch["imu_windows"].shape, (2, 5, 6))
+        self.assertEqual(batch["imu_window_masks"].shape, (2, 5))
+        self.assertEqual(batch["timestamps_ns"].tolist(), [1_000_000_000, 1_050_000_000])
+        self.assertTrue(batch["imu_window_masks"][0, 1:4].all())
+        self.assertFalse(batch["imu_window_masks"][0, 0])
+        self.assertFalse(batch["imu_window_masks"][0, 4])
+        self.assertTrue(
+            np.allclose(batch["imu_windows"][0, 2], [0.1, 0.2, 0.3, 1.0, 2.0, 3.0])
+        )
+
+    def test_composed_dataset_collates_fixed_imu_tensors(self):
+        common_conf = _make_composed_common_conf()
+        composed = ComposedDataset(
+            dataset_configs=[
+                {
+                    "_target_": "data.datasets.euroc.EurocDataset",
+                    "split": "train",
+                    "EUROC_DIR": str(self.synthetic_euroc_root),
+                    "EUROC_ANNOTATION_DIR": str(self.annotation_dir),
+                    "min_num_images": 2,
+                    "camera_names": ("cam0",),
+                    "load_imu": True,
+                    "imu_window_ns": 20_000_000,
+                    "imu_num_samples": 5,
+                    "undistort_images": False,
+                }
+            ],
+            common_config=common_conf,
+        )
+
+        sample = composed[(0, 2, 1.0)]
+        self.assertEqual(sample["imu_windows"].shape, (2, 5, 6))
+        self.assertEqual(sample["imu_window_masks"].shape, (2, 5))
+        self.assertEqual(sample["timestamps_ns"].shape, (2,))
+
+        collated = default_collate([sample, sample])
+        self.assertEqual(collated["imu_windows"].shape, (2, 2, 5, 6))
+        self.assertEqual(collated["imu_window_masks"].shape, (2, 2, 5))
+        self.assertEqual(collated["timestamps_ns"].shape, (2, 2))
+
+    def test_online_degradation_returns_reproducible_labels_and_params(self):
+        common_conf = _make_common_conf()
+        common_conf.training = True
+
+        clean_dataset = EurocDataset(
+            common_conf=common_conf,
+            split="train",
+            EUROC_DIR=str(self.synthetic_euroc_root),
+            EUROC_ANNOTATION_DIR=str(self.annotation_dir),
+            min_num_images=2,
+            camera_names=("cam0",),
+            undistort_images=False,
+        )
+        degraded_dataset = EurocDataset(
+            common_conf=common_conf,
+            split="train",
+            EUROC_DIR=str(self.synthetic_euroc_root),
+            EUROC_ANNOTATION_DIR=str(self.annotation_dir),
+            min_num_images=2,
+            camera_names=("cam0",),
+            undistort_images=False,
+            degradation={
+                "enabled": True,
+                "mode": "online",
+                "settings": {"exposure": 1.0},
+                "severity": "medium",
+                "seed": 42,
+                "return_metadata": True,
+            },
+        )
+
+        clean_batch = clean_dataset.get_data(
+            seq_name="euroc/MH_01_easy/cam0",
+            ids=np.array([0, 1]),
+            img_per_seq=2,
+            aspect_ratio=1.0,
+        )
+        degraded_a = degraded_dataset.get_data(
+            seq_name="euroc/MH_01_easy/cam0",
+            ids=np.array([0, 1]),
+            img_per_seq=2,
+            aspect_ratio=1.0,
+        )
+        degraded_b = degraded_dataset.get_data(
+            seq_name="euroc/MH_01_easy/cam0",
+            ids=np.array([0, 1]),
+            img_per_seq=2,
+            aspect_ratio=1.0,
+        )
+
+        self.assertEqual(degraded_a["degradation_labels"], ["exposure", "exposure"])
+        self.assertEqual(degraded_a["degradation_label_ids"].tolist(), [2, 2])
+        self.assertEqual(degraded_a["degradation_params"], degraded_b["degradation_params"])
+        self.assertTrue(np.array_equal(degraded_a["images"][0], degraded_b["images"][0]))
+        self.assertFalse(np.array_equal(degraded_a["images"][0], clean_batch["images"][0]))
+
+        params = json.loads(degraded_a["degradation_params"][0])
+        self.assertEqual(params["degradation_type"], "exposure")
+        self.assertEqual(params["severity"], "medium")
+        self.assertIn("gain", params["params"])
+        self.assertIn("gamma", params["params"])
+
+        degraded_dataset.set_epoch(1)
+        degraded_epoch_1 = degraded_dataset.get_data(
+            seq_name="euroc/MH_01_easy/cam0",
+            ids=np.array([0, 1]),
+            img_per_seq=2,
+            aspect_ratio=1.0,
+        )
+        self.assertNotEqual(
+            degraded_a["degradation_params"],
+            degraded_epoch_1["degradation_params"],
+        )
+
+    def test_composed_dataset_collates_degradation_fields(self):
+        common_conf = _make_composed_common_conf()
+        common_conf.training = True
+        composed = ComposedDataset(
+            dataset_configs=[
+                {
+                    "_target_": "data.datasets.euroc.EurocDataset",
+                    "split": "train",
+                    "EUROC_DIR": str(self.synthetic_euroc_root),
+                    "EUROC_ANNOTATION_DIR": str(self.annotation_dir),
+                    "min_num_images": 2,
+                    "camera_names": ("cam0",),
+                    "undistort_images": False,
+                    "degradation": {
+                        "enabled": True,
+                        "mode": "online",
+                        "settings": {"exposure": 1.0},
+                        "severity": "medium",
+                        "seed": 42,
+                        "return_metadata": True,
+                    },
+                }
+            ],
+            common_config=common_conf,
+        )
+
+        sample = composed[(0, 2, 1.0)]
+        self.assertEqual(sample["degradation_label_ids"].shape, (2,))
+        self.assertEqual(sample["degradation_labels"], ["exposure", "exposure"])
+        self.assertEqual(len(sample["degradation_params"]), 2)
+
+        collated = default_collate([sample, sample])
+        self.assertEqual(collated["degradation_label_ids"].shape, (2, 2))
+        self.assertIn("exposure", collated["degradation_labels"][0])
 
 
 if __name__ == "__main__":

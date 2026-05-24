@@ -81,6 +81,10 @@ class ComposedDataset(Dataset, ABC):
         """Returns the total number of sequences in the dataset."""
         return self.total_samples
 
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+        if hasattr(self.base_dataset, "set_epoch"):
+            self.base_dataset.set_epoch(epoch)
 
     def __getitem__(self, idx_tuple):
         """
@@ -143,6 +147,24 @@ class ComposedDataset(Dataset, ABC):
             "world_points": world_points,
             "point_masks": point_masks,
         }
+
+        if "imu_windows" in batch:
+            sample["imu_windows"] = torch.from_numpy(
+                np.asarray(batch["imu_windows"], dtype=np.float32)
+            )
+            sample["imu_window_masks"] = torch.from_numpy(
+                np.asarray(batch["imu_window_masks"], dtype=bool)
+            )
+            sample["timestamps_ns"] = torch.from_numpy(
+                np.asarray(batch["timestamps_ns"], dtype=np.int64)
+            )
+
+        if "degradation_labels" in batch:
+            sample["degradation_labels"] = list(batch["degradation_labels"])
+            sample["degradation_label_ids"] = torch.from_numpy(
+                np.asarray(batch["degradation_label_ids"], dtype=np.int64)
+            )
+            sample["degradation_params"] = list(batch["degradation_params"])
 
         # --- Track Processing (if enabled) ---
         if self.load_track:
@@ -210,6 +232,14 @@ class TupleConcatDataset(ConcatDataset):
         # If True, ignores the input index and samples randomly across all datasets
         # This provides an alternative to dataloader shuffling for large datasets
         self.inside_random = common_config.inside_random
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+        for dataset in self.datasets:
+            if hasattr(dataset, "set_epoch"):
+                dataset.set_epoch(epoch)
+            elif hasattr(dataset, "epoch"):
+                dataset.epoch = int(epoch)
 
     def __getitem__(self, idx):
         """

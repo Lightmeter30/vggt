@@ -46,7 +46,7 @@ data:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
         - _target_: data.datasets.euroc.EurocDataset
-          split: test
+          split: val
           EUROC_DIR: /home/zwr/code/my-vggt/dataset/euRoC
           EUROC_ANNOTATION_DIR: /home/zwr/code/my-vggt/dataset/euroc-anno-local
           camera_names:

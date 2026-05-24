@@ -697,6 +697,7 @@ class Trainer:
         tensor_keys = [
             "images", "depths", "extrinsics", "intrinsics", 
             "cam_points", "world_points", "point_masks", 
+            "imu_windows", "imu_window_masks", "timestamps_ns",
         ]        
         string_keys = ["seq_name"]
         
@@ -865,4 +866,3 @@ def get_chunk_from_data(data: Any, chunk_id: int, num_chunks: int) -> Any:
         return [get_chunk_from_data(value, chunk_id, num_chunks) for value in data]
     else:
         return data
-

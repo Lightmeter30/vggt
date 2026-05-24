@@ -9,13 +9,22 @@ import json
 import logging
 import os.path as osp
 import random
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
 from data.base_dataset import BaseDataset
 from data.dataset_util import *
+from data.degradation import (
+    DEFAULT_TRAINING_DEGRADATION_WEIGHTS,
+    DEGRADATION_LABEL_TO_ID,
+    apply_degradation,
+    derive_degradation_seed,
+    parse_degradation_setting,
+    sample_degradation_params,
+    sample_degradation_type,
+)
 
 
 class EurocDataset(BaseDataset):
@@ -34,7 +43,11 @@ class EurocDataset(BaseDataset):
         undistort_images: bool = True,
         max_pose_time_diff_ns: int = 10_000_000,
         load_imu: bool = False,
-        imu_window_ns: int = 25_000_000,
+        imu_window_ns: int = 100_000_000,
+        imu_num_samples: int = 32,
+        imu_feature_order: str = "gyro_accel",
+        empty_imu_policy: str = "zeros",
+        degradation: Optional[Mapping] = None,
     ):
         """
         Dataset wrapper for EuRoC MAV sequences using pre-generated annotations.
@@ -62,6 +75,17 @@ class EurocDataset(BaseDataset):
         self.undistort_images = undistort_images
         self.load_imu = load_imu
         self.imu_window_ns = int(imu_window_ns)
+        self.imu_num_samples = int(imu_num_samples)
+        self.imu_feature_order = imu_feature_order
+        self.empty_imu_policy = empty_imu_policy
+        if self.imu_num_samples <= 0:
+            raise ValueError(f"imu_num_samples must be positive, got {imu_num_samples}")
+        if self.imu_feature_order not in ("gyro_accel", "accel_gyro"):
+            raise ValueError(f"Unsupported imu_feature_order: {imu_feature_order}")
+        if self.empty_imu_policy != "zeros":
+            raise ValueError(f"Unsupported empty_imu_policy: {empty_imu_policy}")
+        self.epoch = 0
+        self._configure_degradation(degradation)
 
         # These knobs now belong to the offline preprocessing step. Keep them in
         # the signature for config compatibility.
@@ -77,7 +101,7 @@ class EurocDataset(BaseDataset):
 
         if split == "train":
             self.len_train = len_train
-        elif split == "test":
+        elif split in ("val", "test"):
             self.len_train = len_test
         else:
             raise ValueError(f"Invalid split: {split}")
@@ -119,6 +143,39 @@ class EurocDataset(BaseDataset):
         logging.info("%s: EuRoC matched frame count: %d", status, self.total_frame_num)
         logging.info("%s: EuRoC dataset length: %d", status, len(self))
 
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def _configure_degradation(self, degradation: Optional[Mapping]) -> None:
+        config = _mapping_to_dict(degradation)
+        self.degradation_enabled = bool(config.get("enabled", False))
+        self.degradation_mode = str(config.get("mode", "online"))
+        self.degradation_severity = str(config.get("severity", "medium"))
+        self.degradation_seed = int(config.get("seed", 0))
+        self.degradation_return_metadata = bool(config.get("return_metadata", True))
+        self.degradation_settings = _mapping_to_dict(
+            config.get("settings", DEFAULT_TRAINING_DEGRADATION_WEIGHTS)
+        )
+        self.degradation_fixed_setting = config.get(
+            "setting", config.get("fixed_setting")
+        )
+
+        explicit_type = config.get("degradation_type", config.get("type"))
+        if self.degradation_fixed_setting is None and explicit_type is not None:
+            degradation_type, severity = parse_degradation_setting(
+                explicit_type,
+                default_severity=self.degradation_severity,
+            )
+            self.degradation_fixed_setting = (
+                "clean" if degradation_type == "clean" else f"{degradation_type}_{severity}"
+            )
+
+        if self.degradation_mode not in ("online", "fixed"):
+            raise ValueError(
+                f"Unsupported degradation mode: {self.degradation_mode}. "
+                "Expected 'online' or 'fixed'."
+            )
+
     def _load_split_annotation(self, split: str) -> Dict[str, Dict]:
         annotation_file = osp.join(self.EUROC_ANNOTATION_DIR, f"euroc_{split}.jgz")
         if not osp.isfile(annotation_file):
@@ -145,11 +202,19 @@ class EurocDataset(BaseDataset):
         for frame in sequence_data["frames"]:
             frames.append(
                 {
+                    "frame_id": int(frame.get("frame_id", len(frames))),
                     "timestamp_ns": int(frame["timestamp_ns"]),
                     "gt_timestamp_ns": int(frame["gt_timestamp_ns"]),
                     "pose_dt_ns": int(frame["pose_dt_ns"]),
                     "image_rel_path": frame["image_rel_path"],
-                    "extrinsics": np.asarray(frame["extrinsics"], dtype=np.float32),
+                    "clean_image_rel_path": frame.get(
+                        "clean_image_rel_path", frame["image_rel_path"]
+                    ),
+                    "degradation": frame.get("degradation"),
+                    "extrinsics": np.asarray(
+                        frame.get("extrinsics", frame.get("extrinsics_w2c")),
+                        dtype=np.float32,
+                    ),
                 }
             )
 
@@ -163,6 +228,10 @@ class EurocDataset(BaseDataset):
 
         return {
             "camera_name": sequence_data["camera_name"],
+            "dataset": sequence_data.get("dataset", "euroc"),
+            "sequence_name": sequence_data.get("sequence_name"),
+            "sequence_path": sequence_data.get("sequence_path"),
+            "split": sequence_data.get("split"),
             "sensor": sensor,
             "frames": frames,
             "imu_data": imu_data,
@@ -184,6 +253,70 @@ class EurocDataset(BaseDataset):
             sensor["undistorted_intrinsics"],
         )
         return undistorted, sensor["undistorted_intrinsics"].copy()
+
+    def _maybe_apply_degradation(
+        self,
+        image: np.ndarray,
+        sequence_data: Dict,
+        frame: Dict,
+        sequence_key: str,
+    ) -> Tuple[np.ndarray, Optional[Dict]]:
+        if not self.degradation_enabled:
+            return image, None
+
+        if self.training and self.degradation_mode == "online":
+            type_seed = derive_degradation_seed(
+                self.degradation_seed,
+                sequence_key,
+                int(frame["frame_id"]),
+                self.epoch,
+                "type",
+            )
+            degradation_type = sample_degradation_type(
+                self.degradation_settings,
+                seed=type_seed,
+            )
+            severity = self.degradation_severity
+        elif self.degradation_mode == "fixed":
+            setting = self.degradation_fixed_setting or "clean"
+            degradation_type, severity = parse_degradation_setting(
+                setting,
+                default_severity=self.degradation_severity,
+            )
+        else:
+            return image, None
+
+        param_seed = None
+        if degradation_type != "clean":
+            param_seed = derive_degradation_seed(
+                self.degradation_seed,
+                sequence_key,
+                int(frame["frame_id"]),
+                0 if self.degradation_mode == "fixed" else self.epoch,
+                degradation_type,
+            )
+
+        degradation_config = sample_degradation_params(
+            degradation_type,
+            severity,
+            seed=param_seed,
+        )
+        degraded, metadata = apply_degradation(image, degradation_config)
+        metadata.update(
+            {
+                "dataset": sequence_data.get("dataset", "euroc"),
+                "sequence_name": sequence_data.get("sequence_name"),
+                "camera_name": sequence_data.get("camera_name"),
+                "split": sequence_data.get("split"),
+                "frame_id": int(frame["frame_id"]),
+                "timestamp_ns": int(frame["timestamp_ns"]),
+                "clean_image_rel_path": frame.get("clean_image_rel_path"),
+                "source_pose_unchanged": True,
+                "source_intrinsics_unchanged": True,
+                "source_imu_unchanged": True,
+            }
+        )
+        return degraded, metadata
 
     def _build_placeholder_depth(
         self, image_shape: Tuple[int, int], intrinsics: np.ndarray
@@ -219,30 +352,71 @@ class EurocDataset(BaseDataset):
         ).astype(np.float32)
         return sparse_depth, sparse_cam_points, sparse_world_points, sparse_mask
 
+    def _empty_imu_window(self) -> Tuple[np.ndarray, np.ndarray]:
+        window = np.zeros((self.imu_num_samples, 6), dtype=np.float32)
+        mask = np.zeros((self.imu_num_samples,), dtype=bool)
+        return window, mask
+
+    def _format_imu_features(
+        self, gyro: np.ndarray, accel: np.ndarray
+    ) -> np.ndarray:
+        if self.imu_feature_order == "gyro_accel":
+            return np.concatenate([gyro, accel], axis=-1).astype(np.float32)
+        return np.concatenate([accel, gyro], axis=-1).astype(np.float32)
+
     def _load_imu_window(
         self, imu_data: Optional[Dict[str, np.ndarray]], center_timestamp_ns: int
-    ) -> Optional[Dict[str, np.ndarray]]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         if imu_data is None:
-            return None
+            logging.warning(
+                "EuRoC IMU data is missing; returning zero IMU window."
+            )
+            return self._empty_imu_window()
 
         timestamps = imu_data["timestamps_ns"]
         if len(timestamps) == 0:
-            return {
-                "timestamps_ns": timestamps,
-                "gyro": imu_data["gyro"],
-                "accel": imu_data["accel"],
-            }
+            logging.warning(
+                "EuRoC IMU data is empty; returning zero IMU window."
+            )
+            return self._empty_imu_window()
 
         start_ts = center_timestamp_ns - self.imu_window_ns
         end_ts = center_timestamp_ns + self.imu_window_ns
         left = int(np.searchsorted(timestamps, start_ts, side="left"))
         right = int(np.searchsorted(timestamps, end_ts, side="right"))
 
-        return {
-            "timestamps_ns": timestamps[left:right],
-            "gyro": imu_data["gyro"][left:right],
-            "accel": imu_data["accel"][left:right],
-        }
+        window_timestamps = timestamps[left:right]
+        if len(window_timestamps) == 0:
+            return self._empty_imu_window()
+
+        target_timestamps = np.linspace(
+            start_ts,
+            end_ts,
+            num=self.imu_num_samples,
+            dtype=np.float64,
+        )
+        gyro = np.zeros((self.imu_num_samples, 3), dtype=np.float32)
+        accel = np.zeros((self.imu_num_samples, 3), dtype=np.float32)
+        valid_mask = (
+            (target_timestamps >= float(window_timestamps[0]))
+            & (target_timestamps <= float(window_timestamps[-1]))
+        )
+
+        for axis in range(3):
+            gyro[:, axis] = np.interp(
+                target_timestamps,
+                window_timestamps.astype(np.float64),
+                imu_data["gyro"][left:right, axis].astype(np.float64),
+            ).astype(np.float32)
+            accel[:, axis] = np.interp(
+                target_timestamps,
+                window_timestamps.astype(np.float64),
+                imu_data["accel"][left:right, axis].astype(np.float64),
+            ).astype(np.float32)
+
+        imu_window = self._format_imu_features(gyro, accel)
+        imu_window[~valid_mask] = 0.0
+        return imu_window, valid_mask.astype(bool)
 
     def get_data(
         self,
@@ -285,6 +459,11 @@ class EurocDataset(BaseDataset):
         intrinsics = []
         original_sizes = []
         imu_windows = []
+        imu_window_masks = []
+        timestamps_ns = []
+        degradation_labels = []
+        degradation_label_ids = []
+        degradation_params = []
 
         for image_idx in ids:
             frame = frames[int(image_idx)]
@@ -295,6 +474,19 @@ class EurocDataset(BaseDataset):
                 continue
 
             image, intri_opencv = self._undistort_image(image, sensor)
+            image, degradation_metadata = self._maybe_apply_degradation(
+                image=image,
+                sequence_data=sequence_data,
+                frame=frame,
+                sequence_key=seq_name,
+            )
+            if degradation_metadata is not None and self.degradation_return_metadata:
+                degradation_label = degradation_metadata["degradation_type"]
+                degradation_labels.append(degradation_label)
+                degradation_label_ids.append(DEGRADATION_LABEL_TO_ID[degradation_label])
+                degradation_params.append(
+                    json.dumps(degradation_metadata, sort_keys=True)
+                )
 
             original_size = np.array(image.shape[:2])
             extri_opencv = frame["extrinsics"].copy()
@@ -338,11 +530,12 @@ class EurocDataset(BaseDataset):
             original_sizes.append(original_size)
 
             if self.load_imu:
-                imu_windows.append(
-                    self._load_imu_window(
-                        sequence_data["imu_data"], frame["timestamp_ns"]
-                    )
+                imu_window, imu_window_mask = self._load_imu_window(
+                    sequence_data["imu_data"], frame["timestamp_ns"]
                 )
+                imu_windows.append(imu_window)
+                imu_window_masks.append(imu_window_mask)
+                timestamps_ns.append(int(frame["timestamp_ns"]))
 
         batch = {
             "seq_name": "euroc_" + seq_name,
@@ -359,6 +552,23 @@ class EurocDataset(BaseDataset):
         }
 
         if self.load_imu:
-            batch["imu_windows"] = imu_windows
+            batch["imu_windows"] = np.stack(imu_windows, axis=0).astype(np.float32)
+            batch["imu_window_masks"] = np.stack(imu_window_masks, axis=0).astype(bool)
+            batch["timestamps_ns"] = np.asarray(timestamps_ns, dtype=np.int64)
+
+        if degradation_labels:
+            batch["degradation_labels"] = degradation_labels
+            batch["degradation_label_ids"] = np.asarray(
+                degradation_label_ids, dtype=np.int64
+            )
+            batch["degradation_params"] = degradation_params
 
         return batch
+
+
+def _mapping_to_dict(config: Optional[Mapping]) -> Dict:
+    if config is None:
+        return {}
+    if hasattr(config, "items"):
+        return dict(config.items())
+    return dict(config)

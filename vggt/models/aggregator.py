@@ -181,7 +181,12 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
+    def forward(
+        self,
+        images: torch.Tensor,
+        motion_tokens: Optional[torch.Tensor] = None,
+        imu_fusion: Optional[nn.Module] = None,
+    ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
@@ -215,6 +220,15 @@ class Aggregator(nn.Module):
 
         # Concatenate special tokens with patch tokens
         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+        if imu_fusion is not None and motion_tokens is not None:
+            tokens = imu_fusion(
+                tokens=tokens,
+                motion_tokens=motion_tokens,
+                patch_start_idx=self.patch_start_idx,
+                batch_size=B,
+                sequence_length=S,
+                patch_token_count=P,
+            )
 
         pos = None
         if self.rope is not None:

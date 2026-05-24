@@ -6,27 +6,63 @@
 
 import torch
 import torch.nn as nn
+from collections.abc import Mapping
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
 
 from vggt.models.aggregator import Aggregator
 from vggt.heads.camera_head import CameraHead
 from vggt.heads.dpt_head import DPTHead
 from vggt.heads.track_head import TrackHead
+from vggt.models.imu_encoder import IMUEncoder
+from vggt.models.visual_imu_fusion import VisualIMUFiLM
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
     def __init__(self, img_size=518, patch_size=14, embed_dim=1024,
-                 enable_camera=True, enable_point=True, enable_depth=True, enable_track=True):
+                 enable_camera=True, enable_point=True, enable_depth=True, enable_track=True,
+                 imu=None, fusion=None, attention_bias=None, degradation_reweight=None):
         super().__init__()
 
         self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
+        self.imu_encoder = None
+        self.imu_fusion = None
+
+        self.imu_enabled = bool(_config_get(imu, "enabled", False))
+        if self.imu_enabled:
+            self.imu_encoder = IMUEncoder(
+                input_dim=int(_config_get(imu, "input_dim", 6)),
+                hidden_dim=int(_config_get(imu, "hidden_dim", 256)),
+                embed_dim=embed_dim,
+                num_layers=int(_config_get(imu, "num_layers", 2)),
+                num_heads=int(_config_get(imu, "num_heads", 4)),
+                dropout=float(_config_get(imu, "dropout", 0.1)),
+            )
+
+        fusion_enabled = bool(_config_get(fusion, "enabled", False))
+        if fusion_enabled:
+            fusion_type = str(_config_get(fusion, "type", "film"))
+            if fusion_type != "film":
+                raise ValueError(f"Unsupported fusion type: {fusion_type}")
+            self.imu_fusion = VisualIMUFiLM(
+                embed_dim=embed_dim,
+                hidden_dim=_config_get(fusion, "hidden_dim", None),
+                zero_init_gamma_scale=float(_config_get(fusion, "zero_init_gamma_scale", 1.0)),
+                zero_init_beta_scale=float(_config_get(fusion, "zero_init_beta_scale", 1.0)),
+            )
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1") if enable_point else None
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1") if enable_depth else None
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_track else None
 
-    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
+    def forward(
+        self,
+        images: torch.Tensor,
+        query_points: torch.Tensor = None,
+        imu_windows: torch.Tensor = None,
+        imu_window_masks: torch.Tensor = None,
+        degradation_metadata=None,
+    ):
         """
         Forward pass of the VGGT model.
 
@@ -58,9 +94,27 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        motion_tokens = None
+        motion_risk = None
+        if self.imu_encoder is not None:
+            if imu_windows is None:
+                raise ValueError("imu.enabled=True requires imu_windows in VGGT.forward().")
+            if imu_windows.ndim == 3:
+                imu_windows = imu_windows.unsqueeze(0)
+            if imu_window_masks is not None and imu_window_masks.ndim == 2:
+                imu_window_masks = imu_window_masks.unsqueeze(0)
+            motion_tokens, motion_risk = self.imu_encoder(imu_windows, imu_window_masks)
+
+        aggregated_tokens_list, patch_start_idx = self.aggregator(
+            images,
+            motion_tokens=motion_tokens,
+            imu_fusion=self.imu_fusion,
+        )
 
         predictions = {}
+        if motion_tokens is not None:
+            predictions["motion_tokens"] = motion_tokens
+            predictions["motion_risk"] = motion_risk
 
         with torch.cuda.amp.autocast(enabled=False):
             if self.camera_head is not None:
@@ -95,3 +149,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         return predictions
 
+
+def _config_get(config, key, default=None):
+    if config is None:
+        return default
+    if isinstance(config, Mapping):
+        return config.get(key, default)
+    return getattr(config, key, default)

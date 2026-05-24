@@ -1,0 +1,96 @@
+defaults:
+  - euroc_camera_only.yaml
+  - _self_
+
+exp_name: euroc_imu_film
+img_size: 224
+max_img_per_gpu: 2
+
+data:
+  train:
+    common_config:
+      img_nums: [2, 2]
+      augs:
+        aspects: [1.0, 1.0]
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.euroc.EurocDataset
+          split: train
+          EUROC_DIR: /home/zwr/code/my-vggt/dataset/euRoC
+          EUROC_ANNOTATION_DIR: /home/zwr/code/my-vggt/dataset/euroc-anno-local
+          camera_names:
+            - cam0
+          load_imu: True
+          imu_num_samples: ${model.imu.num_samples}
+          imu_window_ns: 100000000
+  val:
+    common_config:
+      img_nums: [2, 2]
+      augs:
+        aspects: [1.0, 1.0]
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.euroc.EurocDataset
+          split: val
+          EUROC_DIR: /home/zwr/code/my-vggt/dataset/euRoC
+          EUROC_ANNOTATION_DIR: /home/zwr/code/my-vggt/dataset/euroc-anno-local
+          camera_names:
+            - cam0
+          load_imu: True
+          len_test: 3
+          imu_num_samples: ${model.imu.num_samples}
+          imu_window_ns: 100000000
+
+logging:
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_camera
+        - loss_T
+        - loss_R
+        - loss_FL
+        - motion_risk_mean
+        - motion_risk_std
+    val:
+      keys_to_log:
+        - loss_objective
+        - loss_camera
+        - loss_T
+        - loss_R
+        - loss_FL
+        - motion_risk_mean
+        - motion_risk_std
+
+optim:
+  gradient_clip:
+    configs:
+      - module_name: ["aggregator"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["camera"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["imu_encoder"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["imu_fusion"]
+        max_norm: 1.0
+        norm_type: 2
+
+model:
+  imu:
+    enabled: true
+    num_samples: 32
+    input_dim: 6
+    hidden_dim: 256
+    num_layers: 2
+    num_heads: 4
+    dropout: 0.1
+  fusion:
+    enabled: true
+    type: film
+    insert_at: aggregator_input
+
+distributed:
+  find_unused_parameters: True

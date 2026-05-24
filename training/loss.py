@@ -87,14 +87,22 @@ def compute_camera_loss(
     weight_trans=1.0,       # weight for translation loss
     weight_rot=1.0,         # weight for rotation loss
     weight_focal=0.5,       # weight for focal length loss
+    use_point_mask=True,
+    valid_point_threshold=100,
     **kwargs
 ):
     # List of predicted pose encodings per stage
     pred_pose_encodings = pred_dict['pose_enc_list']
-    # Binary mask for valid points per frame (B, N, H, W)
-    point_masks = batch_data['point_masks']
-    # Only consider frames with enough valid points (>100)
-    valid_frame_mask = point_masks[:, 0].sum(dim=[-1, -2]) > 100
+    if use_point_mask:
+        # Binary mask for valid points per frame (B, N, H, W)
+        point_masks = batch_data['point_masks']
+        valid_frame_mask = point_masks[:, 0].sum(dim=[-1, -2]) > valid_point_threshold
+    else:
+        valid_frame_mask = torch.ones(
+            batch_data["images"].shape[0],
+            dtype=torch.bool,
+            device=batch_data["images"].device,
+        )
     # Number of prediction stages
     n_stages = len(pred_pose_encodings)
 
@@ -805,5 +813,4 @@ def sequence_loss(flow_preds, flow_gt, vis, valids, gamma=0.8, vis_aware=False, 
 
     return flow_loss
 '''
-
 

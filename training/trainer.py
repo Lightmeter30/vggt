@@ -744,7 +744,20 @@ class Trainer:
             A dictionary containing the computed losses.
         """
         # Forward pass
-        y_hat = model(images=batch["images"])
+        model_kwargs = {"images": batch["images"]}
+        for batch_key in ("imu_windows", "imu_window_masks"):
+            if batch_key in batch:
+                model_kwargs[batch_key] = batch[batch_key]
+        if "degradation_metadata" in batch:
+            model_kwargs["degradation_metadata"] = batch["degradation_metadata"]
+        elif "degradation_params" in batch:
+            model_kwargs["degradation_metadata"] = batch["degradation_params"]
+
+        y_hat = model(**model_kwargs)
+        if "motion_risk" in y_hat:
+            motion_risk = y_hat["motion_risk"].float()
+            y_hat["motion_risk_mean"] = motion_risk.mean()
+            y_hat["motion_risk_std"] = motion_risk.std(unbiased=False)
         
         # Loss computation
         loss_dict = self.loss(y_hat, batch)

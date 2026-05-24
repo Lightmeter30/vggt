@@ -1,0 +1,44 @@
+defaults:
+  - euroc_camera_only.yaml
+  - _self_
+
+exp_name: euroc_degraded_baseline
+
+data:
+  train:
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.euroc.EurocDataset
+          split: train
+          EUROC_DIR: /home/zwr/code/my-vggt/dataset/euRoC
+          EUROC_ANNOTATION_DIR: /home/zwr/code/my-vggt/dataset/euroc-anno-local
+          camera_names:
+            - cam0
+          load_imu: False
+          degradation:
+            enabled: true
+            mode: online
+            settings:
+              clean: 0.25
+              motion_blur: 0.25
+              exposure: 0.25
+              mixed: 0.25
+            severity: medium
+            seed: ${seed_value}
+            return_metadata: true
+  val:
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.euroc.EurocDataset
+          split: val
+          EUROC_DIR: /home/zwr/code/my-vggt/dataset/euRoC
+          EUROC_ANNOTATION_DIR: /home/zwr/code/my-vggt/dataset/euroc-anno-local
+          camera_names:
+            - cam0
+          load_imu: False
+          degradation:
+            enabled: true
+            mode: fixed
+            setting: clean
+            seed: ${seed_value}
+            return_metadata: true

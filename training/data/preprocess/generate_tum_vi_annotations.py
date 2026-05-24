@@ -10,6 +10,21 @@ import cv2
 import numpy as np
 import yaml
 
+try:
+    from training.data.preprocess.vi_schema import (
+        add_clean_degradation_defaults,
+        attach_sequence_metadata,
+        ensure_frame_extrinsics_aliases,
+        validate_vi_annotation,
+    )
+except ImportError:
+    from vi_schema import (
+        add_clean_degradation_defaults,
+        attach_sequence_metadata,
+        ensure_frame_extrinsics_aliases,
+        validate_vi_annotation,
+    )
+
 
 def dump_jgz(path: Path, payload: Dict) -> None:
     with gzip.open(path, "wt", encoding="utf-8") as f:
@@ -225,6 +240,7 @@ def build_camera_annotation(
     tum_vi_dir: Path,
     sequence_dir: Path,
     camera_name: str,
+    split: str,
     camera_calibration: Dict,
     mocap_timestamps: np.ndarray,
     world_from_imu: np.ndarray,
@@ -274,10 +290,13 @@ def build_camera_annotation(
 
         frames.append(
             {
+                "frame_id": len(frames),
                 "timestamp_ns": int(image_timestamp),
                 "gt_timestamp_ns": int(mocap_timestamps[gt_index]),
                 "pose_dt_ns": int(pose_dt),
                 "image_rel_path": image_path.relative_to(tum_vi_dir).as_posix(),
+                "clean_image_rel_path": image_path.relative_to(tum_vi_dir).as_posix(),
+                "extrinsics": extrinsics_w2c.tolist(),
                 "extrinsics_w2c": extrinsics_w2c.tolist(),
             }
         )
@@ -293,6 +312,9 @@ def build_camera_annotation(
     intrinsics = camera_calibration["intrinsics"]
     distortion = camera_calibration["distortion"]
     distortion_model = camera_calibration["distortion_model"]
+    imu_from_camera = np.linalg.inv(camera_calibration["camera_from_imu"]).astype(
+        np.float32
+    )
     sequence_payload = {
         "camera_name": camera_name,
         "sensor": {
@@ -304,11 +326,29 @@ def build_camera_annotation(
                 intrinsics, distortion, image_size, distortion_model
             ).tolist(),
             "image_size": image_size,
+            "T_cam_imu": camera_calibration["camera_from_imu"].tolist(),
+            "T_imu_cam": imu_from_camera.tolist(),
             "camera_from_imu": camera_calibration["camera_from_imu"].tolist(),
         },
         "frames": frames,
         "imu_data": imu_data,
+        "diagnostics": {
+            "max_pose_time_diff_ns": int(max_pose_time_diff_ns),
+            "num_frames": int(len(frames)),
+            "num_missing_images": int(stats["missing_images"]),
+            "num_missing_gt": int(stats["pose_gap_skipped"]),
+        },
     }
+    add_clean_degradation_defaults(sequence_payload["frames"])
+    ensure_frame_extrinsics_aliases(sequence_payload["frames"])
+    attach_sequence_metadata(
+        payload=sequence_payload,
+        dataset="tum_vi",
+        sequence_name=sequence_name,
+        sequence_path=sequence_name,
+        camera_name=camera_name,
+        split=split,
+    )
     return sequence_name, sequence_payload, stats
 
 
@@ -317,6 +357,7 @@ def build_sequence_annotations(
     sequence_dir: Path,
     camera_names: Sequence[str],
     max_pose_time_diff_ns: int,
+    split: str,
 ) -> Tuple[Dict[str, Dict], Dict[str, int]]:
     outputs: Dict[str, Dict] = {}
     stats = {
@@ -344,6 +385,7 @@ def build_sequence_annotations(
             tum_vi_dir=tum_vi_dir,
             sequence_dir=sequence_dir,
             camera_name=camera_name,
+            split=split,
             camera_calibration=cameras[camera_name],
             mocap_timestamps=mocap_timestamps,
             world_from_imu=world_from_imu,
@@ -388,6 +430,12 @@ def main() -> None:
         default=10_000_000,
         help="Maximum allowed image/mocap timestamp mismatch in nanoseconds.",
     )
+    parser.add_argument(
+        "--split",
+        choices=["train", "val", "test"],
+        default="test",
+        help="Split label to write into generated TUM-VI annotations.",
+    )
     args = parser.parse_args()
 
     tum_vi_dir = Path(args.tum_vi_dir).resolve()
@@ -410,7 +458,9 @@ def main() -> None:
             sequence_dir=sequence_dir,
             camera_names=args.camera_names,
             max_pose_time_diff_ns=args.max_pose_time_diff_ns,
+            split=args.split,
         )
+        validate_vi_annotation(sequence_payload)
         output_name = f"{sequence_output_stem(tum_vi_dir, sequence_dir)}.jgz"
         dump_jgz(output_dir / output_name, sequence_payload)
         generated_files.append(output_name)

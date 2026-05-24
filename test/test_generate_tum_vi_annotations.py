@@ -121,16 +121,22 @@ class TestGenerateTumViAnnotations(unittest.TestCase):
                 payload = json.load(f)
 
             sequence = payload["dataset-room1_512_16"]
+            self.assertEqual(sequence["schema_version"], "vi_pose_v1")
+            self.assertEqual(sequence["dataset"], "tum_vi")
+            self.assertEqual(sequence["sequence_name"], "dataset-room1_512_16")
+            self.assertEqual(sequence["split"], "test")
             self.assertEqual(sequence["sensor"]["distortion_model"], "equidistant")
             self.assertEqual(sequence["sensor"]["intrinsics"][0][0], 12.0)
             self.assertIn("undistorted_intrinsics", sequence["sensor"])
+            self.assertIn("T_cam_imu", sequence["sensor"])
+            self.assertIn("T_imu_cam", sequence["sensor"])
 
             frame = sequence["frames"][1]
+            self.assertIn("extrinsics", frame)
             self.assertIn("extrinsics_w2c", frame)
-            self.assertNotIn("extrinsics", frame)
             self.assertTrue(
                 np.allclose(
-                    frame["extrinsics_w2c"],
+                    frame["extrinsics"],
                     np.array(
                         [
                             [1.0, 0.0, 0.0, -0.8],
@@ -141,6 +147,8 @@ class TestGenerateTumViAnnotations(unittest.TestCase):
                     atol=1e-6,
                 )
             )
+            self.assertTrue(np.allclose(frame["extrinsics"], frame["extrinsics_w2c"]))
+            self.assertEqual(frame["degradation"]["setting"], "clean")
 
             with open(output_dir / "summary.json", "r", encoding="utf-8") as f:
                 summary = json.load(f)

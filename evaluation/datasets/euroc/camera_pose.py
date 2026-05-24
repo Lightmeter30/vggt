@@ -50,7 +50,9 @@ def _deserialize_frame(frame, euroc_dir):
         "pose_dt_ns": int(frame["pose_dt_ns"]),
         "image_rel_path": frame["image_rel_path"],
         "image_path": os.path.join(str(euroc_dir), frame["image_rel_path"]),
-        "extrinsics": np.asarray(frame["extrinsics"], dtype=np.float64),
+        "extrinsics": np.asarray(
+            frame.get("extrinsics", frame.get("extrinsics_w2c")), dtype=np.float64
+        ),
     }
 
 

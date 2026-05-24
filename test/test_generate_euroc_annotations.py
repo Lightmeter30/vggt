@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from training.data.preprocess import generate_euroc_annotations as gen_euroc
+from training.data.preprocess import inspect_vi_dataset
 
 
 def _write_csv(csv_path: Path, header, rows):
@@ -101,13 +102,15 @@ def _write_asl_sequence(root: Path, relative_sequence: str):
 
 
 class TestGenerateEurocAnnotations(unittest.TestCase):
-    def test_main_writes_one_jgz_per_asl_sequence_with_w2c_extrinsics(self):
+    def test_main_writes_split_jgz_with_vi_schema_and_w2c_extrinsics(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             euroc_dir = root / "euroc"
             output_dir = root / "anno"
             _write_asl_sequence(euroc_dir, "machine_hall/MH_01_easy")
+            _write_asl_sequence(euroc_dir, "machine_hall/MH_05_difficult")
             _write_asl_sequence(euroc_dir, "vicon_room1/V1_01_easy")
+            _write_asl_sequence(euroc_dir, "vicon_room2/V2_02_medium")
 
             argv = [
                 "generate_euroc_annotations.py",
@@ -124,21 +127,47 @@ class TestGenerateEurocAnnotations(unittest.TestCase):
             jgz_names = sorted(path.name for path in output_dir.glob("*.jgz"))
             self.assertEqual(
                 jgz_names,
-                ["machine_hall__MH_01_easy.jgz", "vicon_room1__V1_01_easy.jgz"],
+                ["euroc_test.jgz", "euroc_train.jgz", "euroc_val.jgz"],
             )
-            self.assertFalse((output_dir / "euroc_train.jgz").exists())
-            self.assertFalse((output_dir / "euroc_test.jgz").exists())
+            self.assertTrue((output_dir / "split_manifest.json").is_file())
+            self.assertTrue((output_dir / "schema_version.json").is_file())
 
-            with gzip.open(output_dir / "machine_hall__MH_01_easy.jgz", "rt", encoding="utf-8") as f:
-                payload = json.load(f)
+            with gzip.open(output_dir / "euroc_train.jgz", "rt", encoding="utf-8") as f:
+                train_payload = json.load(f)
+            with gzip.open(output_dir / "euroc_val.jgz", "rt", encoding="utf-8") as f:
+                val_payload = json.load(f)
+            with gzip.open(output_dir / "euroc_test.jgz", "rt", encoding="utf-8") as f:
+                test_payload = json.load(f)
 
-            sequence = payload["machine_hall/MH_01_easy"]
+            self.assertEqual(list(train_payload.keys()), ["euroc/MH_01_easy/cam0"])
+            eval_keys = [
+                "euroc/MH_05_difficult/cam0",
+                "euroc/V1_01_easy/cam0",
+                "euroc/V2_02_medium/cam0",
+            ]
+            self.assertEqual(list(val_payload.keys()), eval_keys)
+            self.assertEqual(list(test_payload.keys()), eval_keys)
+
+            gen_euroc.validate_vi_annotation(train_payload)
+            gen_euroc.validate_vi_annotation(val_payload)
+            gen_euroc.validate_vi_annotation(test_payload)
+
+            sequence = train_payload["euroc/MH_01_easy/cam0"]
+            self.assertEqual(sequence["schema_version"], "vi_pose_v1")
+            self.assertEqual(sequence["dataset"], "euroc")
+            self.assertEqual(sequence["sequence_name"], "MH_01_easy")
+            self.assertEqual(sequence["sequence_path"], "machine_hall/MH_01_easy")
+            self.assertEqual(sequence["split"], "train")
+            self.assertEqual(sequence["sensor"]["T_cam_imu"], np.eye(4).tolist())
+            self.assertEqual(sequence["sensor"]["T_imu_cam"], np.eye(4).tolist())
+
             frame = sequence["frames"][1]
+            self.assertEqual(frame["frame_id"], 1)
+            self.assertIn("extrinsics", frame)
             self.assertIn("extrinsics_w2c", frame)
-            self.assertNotIn("extrinsics", frame)
             self.assertTrue(
                 np.allclose(
-                    frame["extrinsics_w2c"],
+                    frame["extrinsics"],
                     np.array(
                         [
                             [1.0, 0.0, 0.0, -1.0],
@@ -148,6 +177,69 @@ class TestGenerateEurocAnnotations(unittest.TestCase):
                     ),
                     atol=1e-6,
                 )
+            )
+            self.assertEqual(frame["clean_image_rel_path"], frame["image_rel_path"])
+            self.assertEqual(frame["degradation"]["setting"], "clean")
+            self.assertTrue(np.allclose(frame["extrinsics"], frame["extrinsics_w2c"]))
+
+            with open(output_dir / "split_manifest.json", "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            self.assertEqual(manifest["splits"]["train"], ["MH_01_easy"])
+            self.assertEqual(
+                manifest["splits"]["val"],
+                ["MH_05_difficult", "V1_01_easy", "V2_02_medium"],
+            )
+            self.assertEqual(
+                manifest["splits"]["test"],
+                ["MH_05_difficult", "V1_01_easy", "V2_02_medium"],
+            )
+            self.assertEqual(manifest["counts"]["train"]["sequence_count"], 1)
+            self.assertEqual(manifest["counts"]["train"]["frame_count"], 2)
+            self.assertEqual(manifest["counts"]["val"]["sequence_count"], 3)
+            self.assertEqual(manifest["counts"]["test"]["sequence_count"], 3)
+            self.assertEqual(manifest["sequence_to_splits"]["MH_01_easy"], ["train"])
+            self.assertEqual(
+                manifest["sequence_to_splits"]["MH_05_difficult"], ["val", "test"]
+            )
+
+    def test_inspect_vi_dataset_writes_report_and_split_manifest(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            euroc_dir = root / "euroc"
+            output_dir = root / "anno"
+            _write_asl_sequence(euroc_dir, "machine_hall/MH_01_easy")
+            _write_asl_sequence(euroc_dir, "machine_hall/MH_05_difficult")
+            _write_asl_sequence(euroc_dir, "vicon_room1/V1_01_easy")
+            _write_asl_sequence(euroc_dir, "vicon_room2/V2_02_medium")
+
+            argv = [
+                "inspect_vi_dataset.py",
+                "--dataset",
+                "euroc",
+                "--data_root",
+                str(euroc_dir),
+                "--output",
+                str(output_dir / "inspect_report.json"),
+            ]
+            with mock.patch.object(sys, "argv", argv):
+                inspect_vi_dataset.main()
+
+            with open(output_dir / "inspect_report.json", "r", encoding="utf-8") as f:
+                report = json.load(f)
+            with open(output_dir / "split_manifest.json", "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+
+            self.assertEqual(report["sequence_count"], 4)
+            self.assertEqual(report["sequences"]["MH_01_easy"]["gt_count"], 2)
+            self.assertEqual(report["sequences"]["MH_01_easy"]["imu_count"], 1)
+            self.assertEqual(manifest["splits"]["train"], ["MH_01_easy"])
+            self.assertEqual(
+                manifest["splits"]["val"],
+                ["MH_05_difficult", "V1_01_easy", "V2_02_medium"],
+            )
+            self.assertEqual(
+                manifest["splits"]["test"],
+                ["MH_05_difficult", "V1_01_easy", "V2_02_medium"],
             )
 
 

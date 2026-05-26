@@ -3,6 +3,11 @@ import torch.nn as nn
 
 
 class IMUEncoder(nn.Module):
+    """
+    输入: IMU 窗口数据 [B, S, T, 6] (6 维 = 加速度计 3 维 + 陀螺仪 3 维)
+    结构: Linear投影 → 时间位置编码(MLP) → TransformerEncoder(2层) → 均值池化 → 输出投影
+    输出: 运动特征 [B, S, embed_dim] 和 运动风险 [0, 1] 标量, 通过 Sigmoid 预测该帧运动是否"危险"（如快速旋转/模糊）
+    """
     def __init__(
         self,
         input_dim: int = 6,

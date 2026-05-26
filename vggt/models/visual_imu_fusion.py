@@ -3,6 +3,18 @@ import torch.nn as nn
 
 
 class VisualIMUFiLM(nn.Module):
+    """
+    视觉-IMU 融合模块，使用 FiLM（Feature-wise Linear Modulation）机制将运动特征调制到视觉特征上。
+    输入:
+        - tokens: 视觉特征 [B*S, P, C]，其中 P 是每帧的 token 数量（包括特殊 token 和 patch token），C 是特征维度（应与 embed_dim 匹配）
+        - motion_tokens: 运动特征 [B, S, embed_dim]，来自 IMUEncoder 的输出
+        - patch_start_idx: 视觉 token 中 patch token 的起始索引，之前的 token 被视为特殊 token（如 CLS token）
+        - batch_size: 批量大小 B
+        - sequence_length: 序列长度 S
+        - patch_token_count: 可选的 patch token 数量，如果提供则会验证 tokens 中 patch token 的数量是否正确
+    输出:
+        - modulated_tokens: 调制后的视觉特征 [B*S, P, C]
+    """
     def __init__(
         self,
         embed_dim: int = 1024,

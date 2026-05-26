@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -50,3 +51,58 @@ def test_trainer_step_passes_optional_imu_and_degradation_fields():
     assert model.received_kwargs["imu_window_masks"] is batch["imu_window_masks"]
     assert model.received_kwargs["degradation_metadata"] is batch["degradation_metadata"]
 
+
+def test_load_checkpoint_in_val_mode_ignores_optimizer_state(tmp_path):
+    source_model = nn.Linear(1, 1)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "model": source_model.state_dict(),
+            "optimizer": {"state": {}, "param_groups": []},
+            "steps": {"train": 5, "val": 0},
+            "time_elapsed": 12.0,
+        },
+        checkpoint_path,
+    )
+
+    trainer = object.__new__(Trainer)
+    trainer.rank = 0
+    trainer.mode = "val"
+    trainer.model = nn.Linear(1, 1)
+    trainer.optim_conf = SimpleNamespace(amp=SimpleNamespace(enabled=False))
+    trainer.checkpoint_conf = SimpleNamespace(strict=True)
+
+    trainer._load_resuming_checkpoint(str(checkpoint_path))
+
+    assert trainer.steps == {"train": 5, "val": 0}
+    assert trainer.ckpt_time_elapsed == 12.0
+
+
+def test_update_scalars_logs_objective_as_loss_objective():
+    class RecordingMeter:
+        def __init__(self):
+            self.value = None
+            self.count = None
+
+        def update(self, value, count):
+            self.value = value
+            self.count = count
+
+    trainer = object.__new__(Trainer)
+    trainer.rank = 1
+    trainer.logging_conf = SimpleNamespace(log_freq=1)
+    trainer._get_scalar_log_keys = lambda phase: ["loss_objective"]
+
+    meter = RecordingMeter()
+    trainer._update_and_log_scalars(
+        {
+            "objective": torch.tensor(2.5),
+            "extrinsics": torch.zeros(3, 2, 3, 4),
+        },
+        "val",
+        0,
+        {"Loss/val_loss_objective": meter},
+    )
+
+    assert meter.value == 2.5
+    assert meter.count == 3

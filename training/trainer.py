@@ -211,7 +211,7 @@ class Trainer:
             logging.info(f"Model state loaded. Missing keys: {missing or 'None'}. Unexpected keys: {unexpected or 'None'}.")
 
         # Load optimizer state if available and in training mode
-        if "optimizer" in checkpoint:
+        if self.mode != "val" and "optimizer" in checkpoint:
             logging.info(f"Loading optimizer state dict (rank {self.rank})")
             self.optims.optimizer.load_state_dict(checkpoint["optimizer"])
 
@@ -352,6 +352,9 @@ class Trainer:
             skip_saving_parameters=[],
             **checkpoint_content,
         )
+
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
 
 
@@ -777,8 +780,9 @@ class Trainer:
         batch_size = data['extrinsics'].shape[0]
         
         for key in keys_to_log:
-            if key in data:
-                value = data[key].item() if torch.is_tensor(data[key]) else data[key]
+            value_key = "objective" if key == "loss_objective" and key not in data else key
+            if value_key in data:
+                value = data[value_key].item() if torch.is_tensor(data[value_key]) else data[value_key]
                 loss_meters[f"Loss/{phase}_{key}"].update(value, batch_size)
                 if step % self.logging_conf.log_freq == 0 and self.rank == 0:
                     self.tb_writer.log(f"Values/{phase}/{key}", value, step)

@@ -136,6 +136,9 @@ class EurocDataset(BaseDataset):
             self.sequence_list = self.sequence_list[:1]
             self.sequence_list_len = len(self.sequence_list)
 
+        if split in ("val", "test"):
+            self.len_train = min(self.len_train, self.sequence_list_len)
+
         status = "Training" if self.training else "Testing"
         logging.info("EUROC_DIR is %s", self.EUROC_DIR)
         logging.info("EUROC_ANNOTATION_DIR is %s", self.EUROC_ANNOTATION_DIR)

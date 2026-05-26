@@ -256,6 +256,21 @@ class TestEurocDataset(unittest.TestCase):
         self.assertEqual(train_dataset.total_frame_num, 6)
         self.assertEqual(val_dataset.total_frame_num, 3)
 
+    def test_eval_length_uses_filtered_sequence_count(self):
+        val_dataset = EurocDataset(
+            common_conf=self.common_conf,
+            split="val",
+            EUROC_DIR=str(self.synthetic_euroc_root),
+            EUROC_ANNOTATION_DIR=str(self.annotation_dir),
+            min_num_images=2,
+            len_test=10000,
+            camera_names=("cam0",),
+            undistort_images=False,
+        )
+
+        self.assertEqual(len(val_dataset), 1)
+        self.assertEqual(len(val_dataset), val_dataset.sequence_list_len)
+
     def test_deserializes_vi_schema_sensor_frames_and_imu(self):
         dataset = EurocDataset(
             common_conf=self.common_conf,

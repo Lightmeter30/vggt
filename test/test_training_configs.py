@@ -25,7 +25,7 @@ def test_euroc_imu_film_gradient_clip_covers_imu_modules():
     assert "imu_fusion" in module_names
 
 
-def test_euroc_imu_film_uses_small_smoke_training_shape():
+def test_euroc_imu_film_uses_stable_full_training_shape():
     with initialize_config_dir(
         version_base=None,
         config_dir=str(TRAINING_CONFIG_DIR),
@@ -34,8 +34,11 @@ def test_euroc_imu_film_uses_small_smoke_training_shape():
 
     resolved = OmegaConf.to_container(cfg, resolve=True)
 
-    assert resolved["img_size"] == 224
-    assert resolved["max_img_per_gpu"] == 2
-    assert resolved["data"]["train"]["common_config"]["img_nums"] == [2, 2]
+    assert resolved["exp_name"] == "euroc_imu_film_stable_518_s6_mipg12"
+    assert resolved["img_size"] == 518
+    assert resolved["max_img_per_gpu"] == 12
+    assert resolved["limit_train_batches"] is None
+    assert resolved["limit_val_batches"] is None
+    assert resolved["data"]["train"]["common_config"]["img_nums"] == [6, 6]
     assert resolved["data"]["val"]["common_config"]["img_nums"] == [2, 2]
-    assert resolved["data"]["val"]["dataset"]["dataset_configs"][0]["len_test"] == 3
+    assert "len_test" not in resolved["data"]["val"]["dataset"]["dataset_configs"][0]

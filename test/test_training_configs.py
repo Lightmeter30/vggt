@@ -34,11 +34,14 @@ def test_euroc_imu_film_uses_stable_full_training_shape():
 
     resolved = OmegaConf.to_container(cfg, resolve=True)
 
-    assert resolved["exp_name"] == "euroc_imu_film_stable_518_s6_mipg12"
+    assert resolved["exp_name"] == "euroc_imu_film_full_518_s6_mipg12_lr1e-4"
     assert resolved["img_size"] == 518
     assert resolved["max_img_per_gpu"] == 12
-    assert resolved["limit_train_batches"] is None
-    assert resolved["limit_val_batches"] is None
+    assert resolved["max_epochs"] == 10
+    assert resolved["val_epoch_freq"] == 5
+    assert resolved["limit_train_batches"] == 800
+    assert resolved["limit_val_batches"] == 400
+    assert resolved["optim"]["optimizer"]["lr"] == 1e-4
     assert resolved["data"]["train"]["common_config"]["img_nums"] == [6, 6]
     assert resolved["data"]["val"]["common_config"]["img_nums"] == [2, 2]
     assert "len_test" not in resolved["data"]["val"]["dataset"]["dataset_configs"][0]

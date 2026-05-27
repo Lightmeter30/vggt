@@ -2,11 +2,13 @@ defaults:
   - euroc_camera_only.yaml
   - _self_
 
-exp_name: euroc_imu_film_stable_518_s6_mipg12
+exp_name: euroc_imu_film_full_518_s6_mipg12_lr1e-4
 img_size: 518
 max_img_per_gpu: 12
-limit_train_batches: null
-limit_val_batches: null
+max_epochs: 10
+val_epoch_freq: 5
+limit_train_batches: 800
+limit_val_batches: 400
 
 data:
   train:
@@ -64,6 +66,8 @@ logging:
         - motion_risk_std
 
 optim:
+  optimizer:
+    lr: 1e-4
   gradient_clip:
     configs:
       - module_name: ["aggregator"]
@@ -78,6 +82,19 @@ optim:
       - module_name: ["imu_fusion"]
         max_norm: 1.0
         norm_type: 2
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-7
+              end_value: 1e-4
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 1e-4
+              end_value: 1e-6
+          lengths: [0.05, 0.95]
+          interval_scaling: ["rescaled", "rescaled"]
 
 model:
   imu:

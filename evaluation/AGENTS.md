@@ -96,6 +96,19 @@ conda run -n my_vggt_relocation python evaluation/main.py \
     --euroc_anno_dir /home/zwr/code/my-vggt/dataset/euroc-anno-local
 ```
 
+EuRoC 固定退化/IMU-FiLM 评测可追加：
+
+```bash
+--degraded_dir /PATH/TO/degraded/euroc \
+--degradation_settings motion_blur_medium exposure_medium mixed_medium \
+--use_imu \
+--metrics_output_dir evaluation/results
+```
+
+- `--degraded_dir` 默认读取其中的 `degradation_metadata.jsonl`，并先评 clean 再评退化 setting。
+- `--use_imu` 会从 EuRoC annotation 构造 IMU window 并传给模型；IMU-FiLM checkpoint 会按 state dict 自动构造对应模型。
+- EuRoC metrics report 默认写入 `evaluation/results/`，该目录为本地产物。
+
 ## 规则
 
 - 新 dataset / task 必须同步 `TASK_REGISTRY`。

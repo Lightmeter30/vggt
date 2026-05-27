@@ -1,4 +1,8 @@
+import copy
+from datetime import datetime
+import json
 import os
+from pathlib import Path
 import random
 
 import cv2
@@ -18,6 +22,61 @@ def add_arguments(parser):
     parser.add_argument("--min_num_images", type=int, default=24, help="Minimum images required for a sequence.")
     parser.add_argument("--euroc_dir", type=str, required=True, help="Path to the EuRoC dataset root.")
     parser.add_argument("--euroc_anno_dir", type=str, required=True, help="Path to EuRoC annotations.")
+    parser.add_argument(
+        "--degraded_dir",
+        type=str,
+        default=None,
+        help="Optional fixed degraded EuRoC test root. When set, clean is evaluated first, followed by degraded settings.",
+    )
+    parser.add_argument(
+        "--degradation_settings",
+        nargs="+",
+        default=None,
+        help="Optional degraded settings to evaluate. Defaults to all settings found in degradation_metadata.jsonl.",
+    )
+    parser.add_argument(
+        "--degradation_metadata_path",
+        type=str,
+        default=None,
+        help="Optional path to degradation_metadata.jsonl. Defaults to <degraded_dir>/degradation_metadata.jsonl.",
+    )
+    parser.add_argument(
+        "--metrics_output_dir",
+        type=str,
+        default="evaluation/results",
+        help="Directory for EuRoC camera pose metric reports.",
+    )
+    parser.add_argument(
+        "--metrics_report_prefix",
+        type=str,
+        default=None,
+        help="Optional metric report filename prefix. Defaults to baseline or IMU-FiLM based on --use_imu.",
+    )
+    parser.add_argument(
+        "--use_imu",
+        action="store_true",
+        default=False,
+        help="Build IMU windows from EuRoC annotations and pass them to VGGT.",
+    )
+    parser.add_argument(
+        "--imu_window_ns",
+        type=int,
+        default=100_000_000,
+        help="Half-width of the IMU sampling window around each frame timestamp.",
+    )
+    parser.add_argument(
+        "--imu_num_samples",
+        type=int,
+        default=32,
+        help="Number of uniformly sampled IMU entries per frame.",
+    )
+    parser.add_argument(
+        "--imu_feature_order",
+        type=str,
+        choices=("gyro_accel", "accel_gyro"),
+        default="gyro_accel",
+        help="Feature order for IMU windows passed to the model.",
+    )
     parser.add_argument(
         "--camera_names",
         nargs="+",
@@ -43,21 +102,17 @@ def _deserialize_sensor(sensor):
     }
 
 
-def _deserialize_frame(frame, euroc_dir):
+def _deserialize_imu_data(imu_data):
+    if imu_data is None:
+        return None
     return {
-        "timestamp_ns": int(frame["timestamp_ns"]),
-        "gt_timestamp_ns": int(frame["gt_timestamp_ns"]),
-        "pose_dt_ns": int(frame["pose_dt_ns"]),
-        "image_rel_path": frame["image_rel_path"],
-        "image_path": os.path.join(str(euroc_dir), frame["image_rel_path"]),
-        "extrinsics": np.asarray(
-            frame.get("extrinsics", frame.get("extrinsics_w2c")), dtype=np.float64
-        ),
+        "timestamps_ns": np.asarray(imu_data["timestamps_ns"], dtype=np.int64),
+        "gyro": np.asarray(imu_data["gyro"], dtype=np.float32),
+        "accel": np.asarray(imu_data["accel"], dtype=np.float32),
     }
 
 
-def load_euroc_sequence_entries(annotation_path, euroc_dir, camera_names, min_num_images):
-    raw_annotation = load_json_gz(annotation_path)
+def _build_euroc_sequence_entries(raw_annotation, euroc_dir, camera_names, min_num_images):
     camera_filter = set(camera_names or [])
     sequence_entries = []
 
@@ -74,11 +129,112 @@ def load_euroc_sequence_entries(annotation_path, euroc_dir, camera_names, min_nu
                 "seq_name": seq_name,
                 "camera_name": payload["camera_name"],
                 "sensor": _deserialize_sensor(payload["sensor"]),
+                "imu_data": _deserialize_imu_data(payload.get("imu_data")),
                 "frames": frames,
             }
         )
 
     return sequence_entries
+
+
+def _deserialize_frame(frame, euroc_dir):
+    return {
+        "timestamp_ns": int(frame["timestamp_ns"]),
+        "gt_timestamp_ns": int(frame["gt_timestamp_ns"]),
+        "pose_dt_ns": int(frame["pose_dt_ns"]),
+        "image_rel_path": frame["image_rel_path"],
+        "image_path": os.path.join(str(euroc_dir), frame["image_rel_path"]),
+        "extrinsics": np.asarray(
+            frame.get("extrinsics", frame.get("extrinsics_w2c")), dtype=np.float64
+        ),
+    }
+
+
+def load_euroc_sequence_entries(annotation_path, euroc_dir, camera_names, min_num_images):
+    raw_annotation = load_json_gz(annotation_path)
+    return _build_euroc_sequence_entries(
+        raw_annotation=raw_annotation,
+        euroc_dir=euroc_dir,
+        camera_names=camera_names,
+        min_num_images=min_num_images,
+    )
+
+
+def load_degradation_mappings(
+    degraded_dir,
+    metadata_path=None,
+    settings=None,
+    validate_files=True,
+):
+    degraded_dir = Path(degraded_dir)
+    metadata_path = Path(metadata_path) if metadata_path else degraded_dir / "degradation_metadata.jsonl"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"Missing degradation metadata: {metadata_path}")
+
+    settings_filter = set(settings or [])
+    mappings = {}
+
+    with metadata_path.open("r", encoding="utf-8") as fin:
+        for line_number, line in enumerate(fin, start=1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            setting = record["setting"]
+            if settings_filter and setting not in settings_filter:
+                continue
+
+            clean_rel_path = record["clean_image_rel_path"]
+            degraded_rel_path = record["degraded_image_rel_path"]
+            if validate_files:
+                degraded_path = degraded_dir / degraded_rel_path
+                if not degraded_path.is_file():
+                    raise FileNotFoundError(
+                        f"Missing degraded image for {setting} at line {line_number}: "
+                        f"{degraded_path}"
+                    )
+
+            setting_mapping = mappings.setdefault(setting, {})
+            previous = setting_mapping.get(clean_rel_path)
+            if previous is not None and previous != degraded_rel_path:
+                raise ValueError(
+                    f"Conflicting degraded mapping for {clean_rel_path} in {setting}: "
+                    f"{previous} vs {degraded_rel_path}"
+                )
+            setting_mapping[clean_rel_path] = degraded_rel_path
+
+    missing_settings = settings_filter.difference(mappings.keys())
+    if missing_settings:
+        missing = ", ".join(sorted(missing_settings))
+        raise ValueError(f"Missing degradation settings in metadata: {missing}")
+
+    return {setting: mappings[setting] for setting in sorted(mappings)}
+
+
+def remap_euroc_annotation(raw_annotation, path_mapping, setting):
+    remapped = copy.deepcopy(raw_annotation)
+    missing_paths = []
+
+    for payload in remapped.values():
+        for frame in payload["frames"]:
+            clean_rel_path = frame.get("clean_image_rel_path", frame["image_rel_path"])
+            degraded_rel_path = path_mapping.get(clean_rel_path)
+            if degraded_rel_path is None:
+                missing_paths.append(clean_rel_path)
+                continue
+
+            frame["clean_image_rel_path"] = clean_rel_path
+            frame["image_rel_path"] = degraded_rel_path
+            frame["degradation"] = {
+                "setting": setting,
+                "variant_id": setting,
+                "metadata_rel_path": "degradation_metadata.jsonl",
+            }
+
+    if missing_paths:
+        preview = ", ".join(sorted(set(missing_paths))[:3])
+        raise KeyError(f"Missing degraded mapping for {len(missing_paths)} frames: {preview}")
+
+    return remapped
 
 
 def load_euroc_image_object(image_path, sensor, undistort_images):
@@ -98,6 +254,98 @@ def load_euroc_image_object(image_path, sensor, undistort_images):
     return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
 
+def _empty_imu_window(imu_num_samples):
+    return (
+        np.zeros((imu_num_samples, 6), dtype=np.float32),
+        np.zeros((imu_num_samples,), dtype=bool),
+    )
+
+
+def _format_imu_features(gyro, accel, imu_feature_order):
+    if imu_feature_order == "gyro_accel":
+        return np.concatenate([gyro, accel], axis=-1).astype(np.float32)
+    if imu_feature_order == "accel_gyro":
+        return np.concatenate([accel, gyro], axis=-1).astype(np.float32)
+    raise ValueError(f"Unsupported imu_feature_order: {imu_feature_order}")
+
+
+def build_imu_window(
+    imu_data,
+    center_timestamp_ns,
+    imu_window_ns=100_000_000,
+    imu_num_samples=32,
+    imu_feature_order="gyro_accel",
+):
+    if imu_num_samples <= 0:
+        raise ValueError(f"imu_num_samples must be positive, got {imu_num_samples}")
+    if imu_data is None:
+        return _empty_imu_window(imu_num_samples)
+
+    timestamps = imu_data["timestamps_ns"]
+    if len(timestamps) == 0:
+        return _empty_imu_window(imu_num_samples)
+
+    start_ts = int(center_timestamp_ns) - int(imu_window_ns)
+    end_ts = int(center_timestamp_ns) + int(imu_window_ns)
+    left = int(np.searchsorted(timestamps, start_ts, side="left"))
+    right = int(np.searchsorted(timestamps, end_ts, side="right"))
+    window_timestamps = timestamps[left:right]
+    if len(window_timestamps) == 0:
+        return _empty_imu_window(imu_num_samples)
+
+    target_timestamps = np.linspace(
+        start_ts,
+        end_ts,
+        num=imu_num_samples,
+        dtype=np.float64,
+    )
+    gyro = np.zeros((imu_num_samples, 3), dtype=np.float32)
+    accel = np.zeros((imu_num_samples, 3), dtype=np.float32)
+    valid_mask = (
+        (target_timestamps >= float(window_timestamps[0]))
+        & (target_timestamps <= float(window_timestamps[-1]))
+    )
+
+    for axis in range(3):
+        gyro[:, axis] = np.interp(
+            target_timestamps,
+            window_timestamps.astype(np.float64),
+            imu_data["gyro"][left:right, axis].astype(np.float64),
+        ).astype(np.float32)
+        accel[:, axis] = np.interp(
+            target_timestamps,
+            window_timestamps.astype(np.float64),
+            imu_data["accel"][left:right, axis].astype(np.float64),
+        ).astype(np.float32)
+
+    imu_window = _format_imu_features(gyro, accel, imu_feature_order)
+    imu_window[~valid_mask] = 0.0
+    return imu_window, valid_mask.astype(bool)
+
+
+def attach_imu_windows_to_frames(
+    frame_entries,
+    imu_data,
+    imu_window_ns=100_000_000,
+    imu_num_samples=32,
+    imu_feature_order="gyro_accel",
+):
+    updated_entries = []
+    for frame in frame_entries:
+        frame = dict(frame)
+        imu_window, imu_window_mask = build_imu_window(
+            imu_data=imu_data,
+            center_timestamp_ns=frame["timestamp_ns"],
+            imu_window_ns=imu_window_ns,
+            imu_num_samples=imu_num_samples,
+            imu_feature_order=imu_feature_order,
+        )
+        frame["imu_window"] = imu_window
+        frame["imu_window_mask"] = imu_window_mask
+        updated_entries.append(frame)
+    return updated_entries
+
+
 def predict_camera_extrinsics(
     model,
     image_paths,
@@ -106,15 +354,23 @@ def predict_camera_extrinsics(
     device,
     dtype,
 ):
-    del image_paths, frame_entries
+    del image_paths
     images = load_and_preprocess_images_from_objects(image_objects).to(device)
+    model_kwargs = {"images": images}
+    if frame_entries and "imu_window" in frame_entries[0]:
+        model_kwargs["imu_windows"] = torch.from_numpy(
+            np.stack([frame["imu_window"] for frame in frame_entries], axis=0)
+        ).to(device=device, dtype=images.dtype)
+        model_kwargs["imu_window_masks"] = torch.from_numpy(
+            np.stack([frame["imu_window_mask"] for frame in frame_entries], axis=0)
+        ).to(device=device)
 
     with torch.no_grad():
         if device.type == "cuda":
             with torch.cuda.amp.autocast(dtype=dtype):
-                predictions = model(images)
+                predictions = model(**model_kwargs)
         else:
-            predictions = model(images)
+            predictions = model(**model_kwargs)
 
     pose_encoding = predictions["pose_enc"].to(torch.float64)
     extrinsic, _ = pose_encoding_to_extri_intri(pose_encoding, images.shape[-2:])
@@ -129,8 +385,20 @@ def evaluate_sequence(
     dtype,
     undistort_images,
     predictor=None,
+    use_imu=False,
+    imu_window_ns=100_000_000,
+    imu_num_samples=32,
+    imu_feature_order="gyro_accel",
 ):
     frame_entries = [sequence_entry["frames"][index] for index in sampled_indices]
+    if use_imu:
+        frame_entries = attach_imu_windows_to_frames(
+            frame_entries=frame_entries,
+            imu_data=sequence_entry.get("imu_data"),
+            imu_window_ns=imu_window_ns,
+            imu_num_samples=imu_num_samples,
+            imu_feature_order=imu_feature_order,
+        )
     image_paths = [frame["image_path"] for frame in frame_entries]
     image_objects = [
         load_euroc_image_object(path, sequence_entry["sensor"], undistort_images)
@@ -182,6 +450,10 @@ def evaluate_sequences(
     dtype,
     undistort_images,
     predictor=None,
+    use_imu=False,
+    imu_window_ns=100_000_000,
+    imu_num_samples=32,
+    imu_feature_order="gyro_accel",
 ):
     python_rng = random.Random(seed)
     numpy_rng = np.random.default_rng(seed)
@@ -210,6 +482,10 @@ def evaluate_sequences(
             dtype=dtype,
             undistort_images=undistort_images,
             predictor=predictor,
+            use_imu=use_imu,
+            imu_window_ns=imu_window_ns,
+            imu_num_samples=imu_num_samples,
+            imu_feature_order=imu_feature_order,
         )
         per_sequence.append(sequence_result)
         r_errors.extend(sequence_result["rError"])
@@ -242,16 +518,8 @@ def evaluate_sequences(
     }
 
 
-def run(args, model, device, dtype):
-    annotation_path = os.path.join(args.euroc_anno_dir, f"euroc_{args.split}.jgz")
-    sequence_entries = load_euroc_sequence_entries(
-        annotation_path=annotation_path,
-        euroc_dir=args.euroc_dir,
-        camera_names=tuple(args.camera_names),
-        min_num_images=args.min_num_images,
-    )
-
-    results = evaluate_sequences(
+def _evaluate_sequence_entries(args, model, device, dtype, sequence_entries, predictor=None):
+    return evaluate_sequences(
         model=model,
         sequence_entries=sequence_entries,
         num_frames=args.num_frames,
@@ -260,19 +528,151 @@ def run(args, model, device, dtype):
         device=device,
         dtype=dtype,
         undistort_images=not args.no_undistort,
+        predictor=predictor,
+        use_imu=getattr(args, "use_imu", False),
+        imu_window_ns=getattr(args, "imu_window_ns", 100_000_000),
+        imu_num_samples=getattr(args, "imu_num_samples", 32),
+        imu_feature_order=getattr(args, "imu_feature_order", "gyro_accel"),
     )
 
+
+def evaluate_euroc_variants(args, model, device, dtype, predictor=None):
+    annotation_path = os.path.join(args.euroc_anno_dir, f"euroc_{args.split}.jgz")
+    raw_annotation = load_json_gz(annotation_path)
+
+    clean_entries = _build_euroc_sequence_entries(
+        raw_annotation=raw_annotation,
+        euroc_dir=args.euroc_dir,
+        camera_names=tuple(args.camera_names),
+        min_num_images=args.min_num_images,
+    )
+    variant_results = {
+        "clean": _evaluate_sequence_entries(
+            args=args,
+            model=model,
+            device=device,
+            dtype=dtype,
+            sequence_entries=clean_entries,
+            predictor=predictor,
+        )
+    }
+
+    if not getattr(args, "degraded_dir", None):
+        return variant_results
+
+    degradation_mappings = load_degradation_mappings(
+        degraded_dir=args.degraded_dir,
+        metadata_path=getattr(args, "degradation_metadata_path", None),
+        settings=getattr(args, "degradation_settings", None),
+    )
+    for setting, path_mapping in degradation_mappings.items():
+        remapped_annotation = remap_euroc_annotation(
+            raw_annotation=raw_annotation,
+            path_mapping=path_mapping,
+            setting=setting,
+        )
+        degraded_entries = _build_euroc_sequence_entries(
+            raw_annotation=remapped_annotation,
+            euroc_dir=args.degraded_dir,
+            camera_names=tuple(args.camera_names),
+            min_num_images=args.min_num_images,
+        )
+        variant_results[setting] = _evaluate_sequence_entries(
+            args=args,
+            model=model,
+            device=device,
+            dtype=dtype,
+            sequence_entries=degraded_entries,
+            predictor=predictor,
+        )
+
+    return variant_results
+
+
+def _format_variant_lines(variant_name, results):
+    lines = [f"EuRoC variant: {variant_name}"]
     for sequence_result in results["per_sequence"]:
-        print(
+        lines.append(
             f"{sequence_result['seq_name']} R_ACC@5: {sequence_result['R_ACC@5']:.4f} "
             f"T_ACC@5: {sequence_result['T_ACC@5']:.4f}"
         )
-
-    print(
+    lines.append(
         "EuRoC camera pose summary: "
         f"{results['AUC@30']:.4f} (AUC@30), "
         f"{results['AUC@15']:.4f} (AUC@15), "
         f"{results['AUC@5']:.4f} (AUC@5), "
         f"{results['AUC@3']:.4f} (AUC@3)"
     )
-    return results
+    return lines
+
+
+def _format_summary_lines(variant_results):
+    lines = ["EuRoC camera pose variant summary:"]
+    for variant_name, results in variant_results.items():
+        lines.append(
+            f"{variant_name}: "
+            f"{results['AUC@30']:.4f} (AUC@30), "
+            f"{results['AUC@15']:.4f} (AUC@15), "
+            f"{results['AUC@5']:.4f} (AUC@5), "
+            f"{results['AUC@3']:.4f} (AUC@3)"
+        )
+    return lines
+
+
+def write_euroc_metrics_report(args, variant_results):
+    output_dir = Path(args.metrics_output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_prefix = getattr(args, "metrics_report_prefix", None)
+    if report_prefix is None:
+        report_prefix = "euroc_imu_film_test" if getattr(args, "use_imu", False) else "euroc_baseline_test"
+    output_path = output_dir / f"{report_prefix}_{timestamp}.txt"
+    suffix = 1
+    while output_path.exists():
+        output_path = output_dir / f"{report_prefix}_{timestamp}_{suffix}.txt"
+        suffix += 1
+
+    lines = [
+        "EuRoC camera pose IMU-FiLM evaluation" if getattr(args, "use_imu", False) else "EuRoC camera pose baseline evaluation",
+        f"split: {args.split}",
+        f"euroc_dir: {args.euroc_dir}",
+        f"euroc_anno_dir: {args.euroc_anno_dir}",
+        f"degraded_dir: {getattr(args, 'degraded_dir', None)}",
+        f"degradation_settings: {getattr(args, 'degradation_settings', None)}",
+        f"use_imu: {getattr(args, 'use_imu', False)}",
+        f"imu_window_ns: {getattr(args, 'imu_window_ns', None)}",
+        f"imu_num_samples: {getattr(args, 'imu_num_samples', None)}",
+        f"imu_feature_order: {getattr(args, 'imu_feature_order', None)}",
+        f"num_frames: {args.num_frames}",
+        f"seed: {args.seed}",
+        "",
+    ]
+    for variant_name, results in variant_results.items():
+        lines.extend(_format_variant_lines(variant_name, results))
+        lines.append("")
+    lines.extend(_format_summary_lines(variant_results))
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return output_path
+
+
+def run(args, model, device, dtype):
+    variant_results = evaluate_euroc_variants(
+        args=args,
+        model=model,
+        device=device,
+        dtype=dtype,
+    )
+
+    for variant_name, results in variant_results.items():
+        for line in _format_variant_lines(variant_name, results):
+            print(line)
+        print("")
+
+    for line in _format_summary_lines(variant_results):
+        print(line)
+
+    report_path = write_euroc_metrics_report(args, variant_results)
+    print(f"Saved EuRoC metrics report to: {report_path}")
+    if len(variant_results) == 1:
+        return next(iter(variant_results.values()))
+    return variant_results

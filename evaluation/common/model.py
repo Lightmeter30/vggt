@@ -62,12 +62,59 @@ def _extract_state_dict(checkpoint):
     )
 
 
+def _infer_imu_config_from_state_dict(state_dict):
+    if not any(key.startswith("imu_encoder.") for key in state_dict):
+        return None
+
+    input_weight = state_dict.get("imu_encoder.input_proj.weight")
+    output_weight = state_dict.get("imu_encoder.output_proj.weight")
+    if input_weight is None or output_weight is None:
+        raise ValueError("IMU checkpoint is missing imu_encoder input/output projection weights.")
+
+    layer_indices = []
+    prefix = "imu_encoder.temporal_encoder.layers."
+    for key in state_dict:
+        if key.startswith(prefix):
+            rest = key[len(prefix):]
+            layer_index = rest.split(".", 1)[0]
+            if layer_index.isdigit():
+                layer_indices.append(int(layer_index))
+
+    return {
+        "enabled": True,
+        "input_dim": int(input_weight.shape[1]),
+        "hidden_dim": int(input_weight.shape[0]),
+        "num_layers": max(layer_indices) + 1 if layer_indices else 2,
+        "num_heads": 4,
+        "dropout": 0.1,
+    }
+
+
+def _infer_fusion_config_from_state_dict(state_dict):
+    if not any(key.startswith("imu_fusion.") for key in state_dict):
+        return None
+    return {"enabled": True, "type": "film"}
+
+
+def build_model_from_state_dict(state_dict):
+    imu_config = _infer_imu_config_from_state_dict(state_dict)
+    fusion_config = _infer_fusion_config_from_state_dict(state_dict)
+    return VGGT(
+        enable_camera=any(key.startswith("camera_head.") for key in state_dict),
+        enable_point=any(key.startswith("point_head.") for key in state_dict),
+        enable_depth=any(key.startswith("depth_head.") for key in state_dict),
+        enable_track=any(key.startswith("track_head.") for key in state_dict),
+        imu=imu_config,
+        fusion=fusion_config,
+    )
+
+
 def load_model(device, model_path):
     print("Initializing and loading VGGT model...")
-    model = VGGT()
     print(f"USING {model_path}")
     checkpoint = torch.load(model_path, map_location="cpu")
     state_dict = _strip_state_dict_prefixes(_extract_state_dict(checkpoint))
+    model = build_model_from_state_dict(state_dict)
     model.load_state_dict(state_dict)
     model.eval()
     return model.to(device)

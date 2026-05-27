@@ -1,6 +1,7 @@
 import gzip
 import argparse
 import json
+from types import SimpleNamespace
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,10 +14,14 @@ from PIL import Image
 from vggt.utils.load_fn import load_and_preprocess_images_from_objects
 
 from evaluation.common.model import _extract_state_dict, _strip_state_dict_prefixes
+from evaluation.common.model import build_model_from_state_dict
 from evaluation.common.metrics import calculate_auc_np, se3_to_relative_pose_error
 from evaluation.datasets.euroc.camera_pose import (
+    evaluate_euroc_variants,
     evaluate_sequences,
+    load_degradation_mappings,
     load_euroc_sequence_entries,
+    remap_euroc_annotation,
 )
 from evaluation.datasets.realestate10k.camera_pose import (
     add_arguments as add_realestate10k_arguments,
@@ -126,6 +131,26 @@ class TestEvaluationModelLoading(unittest.TestCase):
         self.assertEqual(list(cleaned.keys()), ["camera_head.weight"])
         self.assertTrue(torch.equal(cleaned["camera_head.weight"], tensor))
 
+    def test_build_model_from_state_dict_enables_imu_film_when_checkpoint_has_imu_keys(self):
+        state_dict = {
+            "imu_encoder.input_proj.weight": torch.empty(8, 6),
+            "imu_encoder.temporal_encoder.layers.0.self_attn.in_proj_weight": torch.empty(24, 8),
+            "imu_encoder.temporal_encoder.layers.1.self_attn.in_proj_weight": torch.empty(24, 8),
+            "imu_encoder.output_proj.weight": torch.empty(1024, 8),
+            "imu_fusion.gamma_net.0.weight": torch.empty(8, 1024),
+        }
+
+        model = build_model_from_state_dict(state_dict)
+
+        self.assertTrue(model.imu_enabled)
+        self.assertIsNotNone(model.imu_encoder)
+        self.assertIsNotNone(model.imu_fusion)
+        self.assertEqual(model.imu_encoder.input_dim, 6)
+        self.assertEqual(model.imu_encoder.hidden_dim, 8)
+        self.assertIsNone(model.point_head)
+        self.assertIsNone(model.depth_head)
+        self.assertIsNone(model.track_head)
+
 
 class TestEurocCameraPoseEvaluation(unittest.TestCase):
     def setUp(self):
@@ -196,6 +221,171 @@ class TestEurocCameraPoseEvaluation(unittest.TestCase):
         self.assertAlmostEqual(result["AUC@15"], 1.0)
         self.assertAlmostEqual(result["AUC@5"], 1.0)
         self.assertAlmostEqual(result["AUC@3"], 1.0)
+
+    def test_remap_euroc_annotation_uses_degraded_paths(self):
+        raw_annotation = {
+            "machine_hall/MH_01_easy:cam0": _make_sequence_payload(
+                "cam0",
+                [
+                    "machine_hall/MH_01_easy/mav0/cam0/data/1.png",
+                    "machine_hall/MH_01_easy/mav0/cam0/data/2.png",
+                ],
+                [0.0, 1.0],
+            )
+        }
+        mapping = {
+            "machine_hall/MH_01_easy/mav0/cam0/data/1.png": "motion_blur_medium/MH_01_easy/cam0/1.png",
+            "machine_hall/MH_01_easy/mav0/cam0/data/2.png": "motion_blur_medium/MH_01_easy/cam0/2.png",
+        }
+
+        remapped = remap_euroc_annotation(raw_annotation, mapping, setting="motion_blur_medium")
+
+        frames = remapped["machine_hall/MH_01_easy:cam0"]["frames"]
+        self.assertEqual(frames[0]["image_rel_path"], "motion_blur_medium/MH_01_easy/cam0/1.png")
+        self.assertEqual(
+            frames[0]["clean_image_rel_path"],
+            "machine_hall/MH_01_easy/mav0/cam0/data/1.png",
+        )
+        self.assertEqual(frames[0]["degradation"]["setting"], "motion_blur_medium")
+        self.assertEqual(
+            raw_annotation["machine_hall/MH_01_easy:cam0"]["frames"][0]["image_rel_path"],
+            "machine_hall/MH_01_easy/mav0/cam0/data/1.png",
+        )
+
+    def test_load_degradation_mappings_validates_degraded_images(self):
+        degraded_dir = self.root / "degraded_test"
+        missing_degraded_path = "motion_blur_medium/MH_01_easy/cam0/1.png"
+        metadata_path = degraded_dir / "degradation_metadata.jsonl"
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "setting": "motion_blur_medium",
+                    "clean_image_rel_path": "machine_hall/MH_01_easy/mav0/cam0/data/1.png",
+                    "degraded_image_rel_path": missing_degraded_path,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(FileNotFoundError, missing_degraded_path):
+            load_degradation_mappings(degraded_dir)
+
+    def test_evaluate_euroc_variants_runs_clean_and_degraded_settings(self):
+        frame_paths = [
+            "machine_hall/MH_01_easy/mav0/cam0/data/1.png",
+            "machine_hall/MH_01_easy/mav0/cam0/data/2.png",
+            "machine_hall/MH_01_easy/mav0/cam0/data/3.png",
+        ]
+        settings = ["exposure_medium", "mixed_medium", "motion_blur_medium"]
+        degraded_dir = self.root / "degraded_test"
+        metadata_rows = []
+        for setting in settings:
+            for idx, frame_path in enumerate(frame_paths):
+                degraded_rel_path = f"{setting}/MH_01_easy/cam0/{idx + 1}.png"
+                _write_image(degraded_dir / degraded_rel_path, color=(100 + idx, 30, 40))
+                metadata_rows.append(
+                    {
+                        "setting": setting,
+                        "clean_image_rel_path": frame_path,
+                        "degraded_image_rel_path": degraded_rel_path,
+                    }
+                )
+        with (degraded_dir / "degradation_metadata.jsonl").open("w", encoding="utf-8") as fout:
+            for row in metadata_rows:
+                fout.write(json.dumps(row) + "\n")
+
+        args = SimpleNamespace(
+            split="test",
+            euroc_dir=str(self.euroc_dir),
+            euroc_anno_dir=str(self.anno_dir),
+            degraded_dir=str(degraded_dir),
+            degradation_metadata_path=None,
+            degradation_settings=None,
+            camera_names=("cam0",),
+            min_num_images=2,
+            num_frames=3,
+            fast_eval=False,
+            seed=0,
+            no_undistort=True,
+        )
+
+        def predictor(model, image_paths, image_objects, frame_entries, device, dtype):
+            del model, image_paths, image_objects, device, dtype
+            return torch.from_numpy(
+                np.stack([frame["extrinsics"] for frame in frame_entries], axis=0)
+            ).to(torch.float64)
+
+        results = evaluate_euroc_variants(
+            args=args,
+            model=None,
+            device="cpu",
+            dtype=torch.float32,
+            predictor=predictor,
+        )
+
+        self.assertEqual(
+            list(results.keys()),
+            ["clean", "exposure_medium", "mixed_medium", "motion_blur_medium"],
+        )
+        for result in results.values():
+            self.assertEqual(result["num_sequences"], 1)
+            self.assertAlmostEqual(result["AUC@30"], 1.0)
+
+    def test_evaluate_sequences_builds_imu_windows_for_predictor(self):
+        frame_paths = [
+            "machine_hall/MH_01_easy/mav0/cam0/data/1.png",
+            "machine_hall/MH_01_easy/mav0/cam0/data/2.png",
+            "machine_hall/MH_01_easy/mav0/cam0/data/3.png",
+        ]
+        annotation = {
+            "machine_hall/MH_01_easy:cam0": _make_sequence_payload(
+                "cam0", frame_paths, [0.0, 1.0, 2.0]
+            )
+        }
+        imu_timestamps = [1 - 20_000_000, 1, 1 + 20_000_000]
+        annotation["machine_hall/MH_01_easy:cam0"]["imu_data"] = {
+            "timestamps_ns": imu_timestamps,
+            "gyro": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]],
+            "accel": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
+        }
+        with gzip.open(self.anno_dir / "euroc_imu_test.jgz", "wt", encoding="utf-8") as fout:
+            json.dump(annotation, fout)
+        sequence_entries = load_euroc_sequence_entries(
+            annotation_path=self.anno_dir / "euroc_imu_test.jgz",
+            euroc_dir=self.euroc_dir,
+            camera_names=("cam0",),
+            min_num_images=2,
+        )
+
+        def predictor(model, image_paths, image_objects, frame_entries, device, dtype):
+            del model, image_paths, image_objects, device, dtype
+            self.assertIn("imu_window", frame_entries[0])
+            self.assertIn("imu_window_mask", frame_entries[0])
+            self.assertEqual(frame_entries[0]["imu_window"].shape, (5, 6))
+            self.assertEqual(frame_entries[0]["imu_window_mask"].shape, (5,))
+            self.assertTrue(np.allclose(frame_entries[0]["imu_window"][2], [0.4, 0.5, 0.6, 4.0, 5.0, 6.0]))
+            return torch.from_numpy(
+                np.stack([frame["extrinsics"] for frame in frame_entries], axis=0)
+            ).to(torch.float64)
+
+        result = evaluate_sequences(
+            model=None,
+            sequence_entries=sequence_entries,
+            num_frames=3,
+            fast_eval=False,
+            seed=0,
+            device="cpu",
+            dtype=torch.float32,
+            undistort_images=True,
+            predictor=predictor,
+            use_imu=True,
+            imu_window_ns=20_000_000,
+            imu_num_samples=5,
+        )
+
+        self.assertEqual(result["num_sequences"], 1)
 
 
 class TestRealEstate10KCameraPoseEvaluation(unittest.TestCase):

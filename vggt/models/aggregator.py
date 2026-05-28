@@ -186,11 +186,13 @@ class Aggregator(nn.Module):
         images: torch.Tensor,
         motion_tokens: Optional[torch.Tensor] = None,
         imu_fusion: Optional[nn.Module] = None,
+        attention_capture: Optional[Any] = None,
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            attention_capture: Optional capture session used to record selected global attention maps.
 
         Returns:
             (list[torch.Tensor], int):
@@ -233,6 +235,7 @@ class Aggregator(nn.Module):
         pos = None
         if self.rope is not None:
             pos = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device=images.device)
+        patch_grid = (H // self.patch_size, W // self.patch_size)
 
         if self.patch_start_idx > 0:
             # do not use position embedding for special tokens (camera and register tokens)
@@ -256,7 +259,15 @@ class Aggregator(nn.Module):
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
+                        tokens,
+                        B,
+                        S,
+                        P,
+                        C,
+                        global_idx,
+                        pos=pos,
+                        attention_capture=attention_capture,
+                        patch_grid=patch_grid,
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -295,7 +306,18 @@ class Aggregator(nn.Module):
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
+    def _process_global_attention(
+        self,
+        tokens,
+        B,
+        S,
+        P,
+        C,
+        global_idx,
+        pos=None,
+        attention_capture=None,
+        patch_grid=None,
+    ):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
@@ -312,7 +334,18 @@ class Aggregator(nn.Module):
             if self.training:
                 tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos)
+                attn_context = None
+                if attention_capture is not None and patch_grid is not None:
+                    attn_context = attention_capture.make_context(
+                        block_index=global_idx,
+                        attention_type="global",
+                        batch_size=B,
+                        sequence_length=S,
+                        patch_start_idx=self.patch_start_idx,
+                        patch_grid=patch_grid,
+                        token_count=S * P,
+                    )
+                tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_context=attn_context)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 

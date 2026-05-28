@@ -62,6 +62,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         imu_windows: torch.Tensor = None,
         imu_window_masks: torch.Tensor = None,
         degradation_metadata=None,
+        attention_capture=None,
     ):
         """
         Forward pass of the VGGT model.
@@ -72,6 +73,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             query_points (torch.Tensor, optional): Query points for tracking, in pixel coordinates.
                 Shape: [N, 2] or [B, N, 2], where N is the number of query points.
                 Default: None
+            attention_capture (optional): Capture session used by visualization tools to record global attention maps.
 
         Returns:
             dict: A dictionary containing the following predictions:
@@ -105,11 +107,13 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 imu_window_masks = imu_window_masks.unsqueeze(0)
             motion_tokens, motion_risk = self.imu_encoder(imu_windows, imu_window_masks)
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(
-            images,
-            motion_tokens=motion_tokens,
-            imu_fusion=self.imu_fusion,
-        )
+        aggregator_kwargs = {
+            "motion_tokens": motion_tokens,
+            "imu_fusion": self.imu_fusion,
+        }
+        if attention_capture is not None:
+            aggregator_kwargs["attention_capture"] = attention_capture
+        aggregated_tokens_list, patch_start_idx = self.aggregator(images, **aggregator_kwargs)
 
         predictions = {}
         if motion_tokens is not None:

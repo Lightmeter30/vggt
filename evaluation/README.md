@@ -23,6 +23,20 @@
 CUDA_VISIBLE_DEVICES=n conda run ...
 ```
 
+### Attention 可视化
+
+```bash
+conda run -n my_vggt_relocation python evaluation/visualize_attention.py \
+    --image_dir /PATH/TO/images \
+    --model_path /YOUR/MODEL/PATH \
+    --output_dir outputs/attention_vis
+
+conda run -n my_vggt_relocation python evaluation/compose_attention_grid.py \
+    --run_dir outputs/attention_vis/run_000
+```
+
+`visualize_attention.py` 会写出 `manifest.json` 和逐层 attention overlay；`compose_attention_grid.py` 可把同一 run 合成网格图。
+
 ### EuRoC
 
 ```bash

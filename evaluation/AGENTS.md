@@ -3,6 +3,7 @@
 ## 范围
 
 - `main.py`: 统一评测 CLI。
+- `visualize_attention.py`, `compose_attention_grid.py`: attention 可视化与拼图工具。
 - `tasks.py`: dataset / task 注册。
 - `common/`: 模型加载、设备 / dtype、指标、IO。
 - `datasets/`: `co3d`、`euroc`、`realestate10k`、`realx3d` 评测实现。
@@ -32,6 +33,21 @@ conda run -n my_vggt_relocation python evaluation/main.py \
 ```bash
 conda run -n my_vggt_relocation python -m pytest test/test_evaluation.py -q
 ```
+
+Attention 可视化：
+
+```bash
+conda run -n my_vggt_relocation python evaluation/visualize_attention.py \
+    --image_dir /PATH/TO/images \
+    --model_path /home/zwr/code/my-vggt/ckpt/model.pt \
+    --output_dir outputs/attention_vis
+
+conda run -n my_vggt_relocation python evaluation/compose_attention_grid.py \
+    --run_dir outputs/attention_vis/run_000
+```
+
+- `visualize_attention.py` 当前只自动支持 image-only checkpoint；IMU-FiLM checkpoint 需要显式补 IMU window 输入后再用。
+- attention 可视化产物写入 `outputs/attention_vis/run_XXX/manifest.json` 和 PNG。
 
 ## RealEstate10K
 

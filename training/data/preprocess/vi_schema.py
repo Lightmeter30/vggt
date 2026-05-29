@@ -152,6 +152,41 @@ def build_split_manifest(
     return manifest
 
 
+def build_sequence_manifest(
+    *,
+    dataset: str,
+    sequence_records: Mapping[str, Mapping],
+    camera_names: Sequence[str],
+    max_pose_time_diff_ns: int,
+) -> Dict:
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "dataset": dataset,
+        "split_policy": "configured_in_training",
+        "camera_names": list(camera_names),
+        "max_pose_time_diff_ns": int(max_pose_time_diff_ns),
+        "sequences": dict(sequence_records),
+    }
+    validate_sequence_manifest(manifest)
+    return manifest
+
+
+def validate_sequence_manifest(manifest: Mapping) -> None:
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported sequence manifest schema_version: {manifest.get('schema_version')}"
+        )
+    if manifest.get("split_policy") != "configured_in_training":
+        raise ValueError("sequence manifest split_policy must be configured_in_training")
+    sequences = manifest.get("sequences")
+    if not isinstance(sequences, Mapping):
+        raise ValueError("sequence manifest must contain a 'sequences' mapping")
+    for sequence_name, record in sequences.items():
+        for key in ["file", "sequence_path", "frame_count", "camera_names"]:
+            if key not in record:
+                raise ValueError(f"sequence manifest record {sequence_name} missing {key}")
+
+
 def validate_split_manifest(manifest: Mapping) -> None:
     if manifest.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(
@@ -186,14 +221,15 @@ def attach_sequence_metadata(
     sequence_name: str,
     sequence_path: str,
     camera_name: str,
-    split: str,
+    split: Optional[str] = None,
 ) -> MutableMapping:
     payload["schema_version"] = SCHEMA_VERSION
     payload["dataset"] = dataset
     payload["sequence_name"] = sequence_name
     payload["sequence_path"] = sequence_path
     payload["camera_name"] = camera_name
-    payload["split"] = split
+    if split is not None:
+        payload["split"] = split
     return payload
 
 
@@ -225,7 +261,6 @@ def validate_vi_sequence(sequence: Mapping) -> None:
         "dataset",
         "sequence_name",
         "camera_name",
-        "split",
         "sensor",
         "frames",
         "imu_data",
@@ -236,7 +271,7 @@ def validate_vi_sequence(sequence: Mapping) -> None:
 
     if sequence["schema_version"] != SCHEMA_VERSION:
         raise ValueError(f"Unsupported VI schema_version: {sequence['schema_version']}")
-    if sequence["split"] not in SPLIT_NAMES:
+    if "split" in sequence and sequence["split"] not in SPLIT_NAMES:
         raise ValueError(f"Invalid VI split: {sequence['split']}")
 
     sensor = sequence["sensor"]

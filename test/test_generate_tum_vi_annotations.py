@@ -124,7 +124,7 @@ class TestGenerateTumViAnnotations(unittest.TestCase):
             self.assertEqual(sequence["schema_version"], "vi_pose_v1")
             self.assertEqual(sequence["dataset"], "tum_vi")
             self.assertEqual(sequence["sequence_name"], "dataset-room1_512_16")
-            self.assertEqual(sequence["split"], "test")
+            self.assertNotIn("split", sequence)
             self.assertEqual(sequence["sensor"]["distortion_model"], "equidistant")
             self.assertEqual(sequence["sensor"]["intrinsics"][0][0], 12.0)
             self.assertIn("undistorted_intrinsics", sequence["sensor"])
@@ -148,12 +148,19 @@ class TestGenerateTumViAnnotations(unittest.TestCase):
                 )
             )
             self.assertTrue(np.allclose(frame["extrinsics"], frame["extrinsics_w2c"]))
-            self.assertEqual(frame["degradation"]["setting"], "clean")
+            self.assertNotIn("degradation", frame)
 
             with open(output_dir / "summary.json", "r", encoding="utf-8") as f:
                 summary = json.load(f)
             self.assertEqual(summary["dataset_format"], "tum_vi")
             self.assertEqual(summary["generated_files"], ["dataset-room1_512_16.jgz"])
+            with open(output_dir / "sequence_manifest.json", "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            self.assertEqual(manifest["split_policy"], "configured_in_training")
+            self.assertEqual(
+                manifest["sequences"]["dataset-room1_512_16"]["distortion_models"],
+                {"cam0": "equidistant"},
+            )
 
 
 if __name__ == "__main__":

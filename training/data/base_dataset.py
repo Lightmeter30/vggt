@@ -245,7 +245,7 @@ class BaseDataset(Dataset):
 
 
         Args:
-            ids (list): Initial list of IDs. The first element is used as the anchor.
+            ids (list): 初始 ID 列表，第一个元素只作为邻近采样锚点。
             full_seq_num (int): Total number of items in the full sequence.
             expand_ratio (float, optional): Factor by which the number of IDs expands
                 around the start index. Default is 2.0 if neither expand_ratio nor
@@ -254,8 +254,7 @@ class BaseDataset(Dataset):
                 start index. If provided, expand_ratio is ignored.
 
         Returns:
-            numpy.ndarray: Array of sampled IDs, with the first element being the
-                original start index.
+            numpy.ndarray: 按原始帧序升序排列的采样 ID，重复帧会保留。
 
         Examples:
             # Using expand_ratio (default behavior)
@@ -297,7 +296,7 @@ class BaseDataset(Dataset):
             replace=True,   # we accept the situation that some sampled ids are the same
         )
 
-        # Insert the start_idx at the beginning
+        # 先把锚点纳入采样结果，再按帧序排序，避免时序输入被锚点置首打乱。
         result_ids = np.insert(sampled_ids, 0, start_idx)
 
-        return result_ids
+        return np.sort(result_ids)

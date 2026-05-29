@@ -15,7 +15,7 @@ try:
     )
     from training.data.preprocess.vi_schema import (
         EUROC_SPLIT_SEQUENCES,
-        build_split_manifest,
+        build_sequence_manifest,
         normalize_split_sequences,
         sequence_to_split_roles,
         short_sequence_name,
@@ -31,7 +31,7 @@ except ImportError:
     )
     from vi_schema import (
         EUROC_SPLIT_SEQUENCES,
-        build_split_manifest,
+        build_sequence_manifest,
         normalize_split_sequences,
         sequence_to_split_roles,
         short_sequence_name,
@@ -91,11 +91,12 @@ def inspect_euroc_sequence(
         sensor_ok = False
         sensor_fields = {}
         if sensor_yaml.is_file():
-            intrinsics, distortion, body_from_camera = load_camera_sensor(sensor_yaml)
+            intrinsics, distortion, body_from_camera, distortion_model = load_camera_sensor(sensor_yaml)
             sensor_ok = True
             sensor_fields = {
                 "intrinsics_shape": list(intrinsics.shape),
                 "distortion_len": int(len(distortion)),
+                "distortion_model": distortion_model,
                 "T_imu_cam_shape": list(body_from_camera.shape),
             }
 
@@ -130,12 +131,8 @@ def inspect_euroc(
     max_pose_time_diff_ns: int,
 ) -> Dict:
     sequence_dirs = discover_sequences(data_root)
-    split_sequences = normalize_split_sequences(EUROC_SPLIT_SEQUENCES)
-    split_roles_by_sequence = sequence_to_split_roles(split_sequences)
-
     sequences = {}
-    sequence_paths = {}
-    frame_counts = {}
+    sequence_records = {}
     for sequence_dir in sequence_dirs:
         stats = inspect_euroc_sequence(
             euroc_dir=data_root,
@@ -144,22 +141,26 @@ def inspect_euroc(
             max_pose_time_diff_ns=max_pose_time_diff_ns,
         )
         sequence_name = stats["sequence_name"]
-        if sequence_name not in split_roles_by_sequence:
-            raise ValueError(
-                f"No EuRoC split configured for sequence {sequence_name} "
-                f"({stats['sequence_path']})"
-            )
         sequences[sequence_name] = stats
-        sequence_paths[sequence_name] = stats["sequence_path"]
-        frame_counts[sequence_name] = stats["frame_count"]
+        sequence_records[sequence_name] = {
+            "file": f"{stats['sequence_path'].replace('/', '__')}.jgz",
+            "sequence_path": stats["sequence_path"],
+            "frame_count": stats["frame_count"],
+            "camera_names": list(camera_names),
+            "distortion_models": {
+                camera_name: camera_stats["sensor_fields"].get(
+                    "distortion_model", "radial-tangential"
+                )
+                for camera_name, camera_stats in stats["per_camera"].items()
+                if camera_stats["sensor_ok"]
+            },
+        }
 
-    manifest = build_split_manifest(
+    manifest = build_sequence_manifest(
         dataset="euroc",
-        sequence_paths=sequence_paths,
-        frame_counts=frame_counts,
+        sequence_records=sequence_records,
         camera_names=camera_names,
         max_pose_time_diff_ns=max_pose_time_diff_ns,
-        split_sequences=split_sequences,
     )
     return {
         "dataset": "euroc",
@@ -167,7 +168,7 @@ def inspect_euroc(
         "camera_names": list(camera_names),
         "sequence_count": len(sequences),
         "sequences": sequences,
-        "split_manifest": manifest,
+        "sequence_manifest": manifest,
     }
 
 
@@ -205,20 +206,17 @@ def main() -> None:
     manifest_output = (
         Path(args.manifest_output).resolve()
         if args.manifest_output
-        else output_path.parent / "split_manifest.json"
+        else output_path.parent / "sequence_manifest.json"
     )
     manifest_output.parent.mkdir(parents=True, exist_ok=True)
     with open(manifest_output, "w", encoding="utf-8") as f:
-        json.dump(report["split_manifest"], f, indent=2, ensure_ascii=False)
+        json.dump(report["sequence_manifest"], f, indent=2, ensure_ascii=False)
 
     print(f"Wrote inspection report: {output_path}")
-    print(f"Wrote split manifest: {manifest_output}")
+    print(f"Wrote sequence manifest: {manifest_output}")
     print(f"Discovered sequences: {report['sequence_count']}")
-    for split, counts in report["split_manifest"]["counts"].items():
-        print(
-            f"{split}: sequences={counts['sequence_count']} "
-            f"frames={counts['frame_count']}"
-        )
+    for sequence_name, record in report["sequence_manifest"]["sequences"].items():
+        print(f"{sequence_name}: frames={record['frame_count']}")
 
 
 if __name__ == "__main__":

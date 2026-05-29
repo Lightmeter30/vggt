@@ -12,15 +12,15 @@ import yaml
 
 try:
     from training.data.preprocess.vi_schema import (
-        add_clean_degradation_defaults,
         attach_sequence_metadata,
+        build_sequence_manifest,
         ensure_frame_extrinsics_aliases,
         validate_vi_annotation,
     )
 except ImportError:
     from vi_schema import (
-        add_clean_degradation_defaults,
         attach_sequence_metadata,
+        build_sequence_manifest,
         ensure_frame_extrinsics_aliases,
         validate_vi_annotation,
     )
@@ -240,7 +240,7 @@ def build_camera_annotation(
     tum_vi_dir: Path,
     sequence_dir: Path,
     camera_name: str,
-    split: str,
+    split: Optional[str],
     camera_calibration: Dict,
     mocap_timestamps: np.ndarray,
     world_from_imu: np.ndarray,
@@ -339,7 +339,6 @@ def build_camera_annotation(
             "num_missing_gt": int(stats["pose_gap_skipped"]),
         },
     }
-    add_clean_degradation_defaults(sequence_payload["frames"])
     ensure_frame_extrinsics_aliases(sequence_payload["frames"])
     attach_sequence_metadata(
         payload=sequence_payload,
@@ -385,7 +384,7 @@ def build_sequence_annotations(
             tum_vi_dir=tum_vi_dir,
             sequence_dir=sequence_dir,
             camera_name=camera_name,
-            split=split,
+            split=None,
             camera_calibration=cameras[camera_name],
             mocap_timestamps=mocap_timestamps,
             world_from_imu=world_from_imu,
@@ -452,6 +451,7 @@ def main() -> None:
     }
     generated_files = []
     per_sequence_stats = {}
+    sequence_records = {}
     for sequence_dir in sequence_dirs:
         sequence_payload, sequence_stats = build_sequence_annotations(
             tum_vi_dir=tum_vi_dir,
@@ -470,6 +470,24 @@ def main() -> None:
             "file": output_name,
             "stats": sequence_stats,
         }
+        distortion_models = {
+            payload["camera_name"]: payload["sensor"].get(
+                "distortion_model", "radial-tangential"
+            )
+            for payload in sequence_payload.values()
+        }
+        camera_list = sorted(payload["camera_name"] for payload in sequence_payload.values())
+        frame_count = max(
+            (len(payload["frames"]) for payload in sequence_payload.values()),
+            default=0,
+        )
+        sequence_records[sequence_key] = {
+            "file": output_name,
+            "sequence_path": sequence_key,
+            "frame_count": int(frame_count),
+            "camera_names": camera_list,
+            "distortion_models": distortion_models,
+        }
         for key in total_stats:
             total_stats[key] += sequence_stats[key]
 
@@ -484,6 +502,14 @@ def main() -> None:
     }
     with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
+    manifest = build_sequence_manifest(
+        dataset="tum_vi",
+        sequence_records=sequence_records,
+        camera_names=args.camera_names,
+        max_pose_time_diff_ns=args.max_pose_time_diff_ns,
+    )
+    with open(output_dir / "sequence_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
 
     print(f"Generated annotations under: {output_dir}")
     print(f"Discovered sequences: {len(sequence_dirs)}")

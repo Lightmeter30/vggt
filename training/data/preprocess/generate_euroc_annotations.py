@@ -16,8 +16,8 @@ try:
         EUROC_SPLIT_SEQUENCES,
         SCHEMA_VERSION,
         SPLIT_NAMES,
-        add_clean_degradation_defaults,
         attach_sequence_metadata,
+        build_sequence_manifest,
         build_split_manifest,
         ensure_frame_extrinsics_aliases,
         normalize_split_sequences,
@@ -31,8 +31,8 @@ except ImportError:
         EUROC_SPLIT_SEQUENCES,
         SCHEMA_VERSION,
         SPLIT_NAMES,
-        add_clean_degradation_defaults,
         attach_sequence_metadata,
+        build_sequence_manifest,
         build_split_manifest,
         ensure_frame_extrinsics_aliases,
         normalize_split_sequences,
@@ -69,7 +69,7 @@ def discover_sequences(euroc_dir: Path) -> List[Path]:
 
 def load_camera_sensor(
     sensor_yaml_path: Path,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str]:
     with open(sensor_yaml_path, "r", encoding="utf-8") as f:
         sensor_data = yaml.safe_load(f)
 
@@ -90,7 +90,10 @@ def load_camera_sensor(
     body_from_camera = np.array(
         sensor_data["T_BS"]["data"], dtype=np.float32
     ).reshape(4, 4)
-    return intrinsics, distortion, body_from_camera
+    distortion_model = str(sensor_data.get("distortion_model", "radial-tangential"))
+    if distortion_model == "radtan":
+        distortion_model = "radial-tangential"
+    return intrinsics, distortion, body_from_camera, distortion_model
 
 
 def load_groundtruth(gt_csv_path: Path) -> Tuple[np.ndarray, np.ndarray]:
@@ -205,9 +208,20 @@ def read_image_size(image_path: Path) -> Optional[List[int]]:
 
 
 def compute_undistorted_intrinsics(
-    intrinsics: np.ndarray, distortion: np.ndarray, image_size: Sequence[int]
+    intrinsics: np.ndarray,
+    distortion: np.ndarray,
+    image_size: Sequence[int],
+    distortion_model: str = "radial-tangential",
 ) -> np.ndarray:
     height, width = int(image_size[0]), int(image_size[1])
+    if distortion_model == "equidistant":
+        return cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+            intrinsics,
+            distortion.reshape(-1, 1),
+            (width, height),
+            np.eye(3),
+            balance=0.0,
+        ).astype(np.float32)
     undistorted_intrinsics, _ = cv2.getOptimalNewCameraMatrix(
         intrinsics, distortion, (width, height), 0.0, (width, height)
     )
@@ -215,14 +229,15 @@ def compute_undistorted_intrinsics(
 
 
 def build_camera_annotation(
-    euroc_dir: Path,
+    asl_dir: Path,
+    dataset_name: str,
     sequence_dir: Path,
     camera_name: str,
-    split: str,
     gt_timestamps: np.ndarray,
     world_from_body: np.ndarray,
     imu_data: Optional[Dict[str, List]],
     max_pose_time_diff_ns: int,
+    split: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[Dict], Dict[str, int]]:
     mav0_dir = sequence_dir / "mav0"
     camera_dir = mav0_dir / camera_name
@@ -240,7 +255,9 @@ def build_camera_annotation(
         stats["missing_images"] += 1
         return None, None, stats
 
-    intrinsics, distortion, body_from_camera = load_camera_sensor(camera_sensor_yaml)
+    intrinsics, distortion, body_from_camera, distortion_model = load_camera_sensor(
+        camera_sensor_yaml
+    )
     image_rows = load_image_rows(camera_csv)
 
     frames = []
@@ -272,8 +289,7 @@ def build_camera_annotation(
                 "timestamp_ns": int(image_timestamp),
                 "gt_timestamp_ns": int(gt_timestamps[gt_index]),
                 "pose_dt_ns": int(pose_dt),
-                "image_rel_path": image_path.relative_to(euroc_dir).as_posix(),
-                "clean_image_rel_path": image_path.relative_to(euroc_dir).as_posix(),
+                "image_rel_path": image_path.relative_to(asl_dir).as_posix(),
                 "extrinsics": camera_from_world.tolist(),
                 "extrinsics_w2c": camera_from_world.tolist(),
             }
@@ -283,9 +299,9 @@ def build_camera_annotation(
     if image_size is None:
         return None, None, stats
 
-    sequence_path = sequence_dir.relative_to(euroc_dir).as_posix()
+    sequence_path = sequence_dir.relative_to(asl_dir).as_posix()
     sequence_name = short_sequence_name(sequence_path)
-    entry_key = sequence_entry_key("euroc", sequence_name, camera_name)
+    entry_key = sequence_entry_key(dataset_name, sequence_name, camera_name)
 
     imu_from_camera = body_from_camera
     camera_from_imu = np.linalg.inv(imu_from_camera).astype(np.float32)
@@ -294,8 +310,9 @@ def build_camera_annotation(
         "sensor": {
             "intrinsics": intrinsics.tolist(),
             "distortion": distortion.tolist(),
+            "distortion_model": distortion_model,
             "undistorted_intrinsics": compute_undistorted_intrinsics(
-                intrinsics, distortion, image_size
+                intrinsics, distortion, image_size, distortion_model
             ).tolist(),
             "image_size": image_size,
             "T_cam_imu": camera_from_imu.tolist(),
@@ -310,17 +327,64 @@ def build_camera_annotation(
             "num_missing_gt": int(stats["pose_gap_skipped"]),
         },
     }
-    add_clean_degradation_defaults(sequence_payload["frames"])
     ensure_frame_extrinsics_aliases(sequence_payload["frames"])
     attach_sequence_metadata(
         payload=sequence_payload,
-        dataset="euroc",
+        dataset=dataset_name,
         sequence_name=sequence_name,
         sequence_path=sequence_path,
         camera_name=camera_name,
         split=split,
     )
     return entry_key, sequence_payload, stats
+
+
+def build_asl_annotations(
+    asl_dir: Path,
+    dataset_name: str,
+    sequence_dirs: Sequence[Path],
+    camera_names: Sequence[str],
+    max_pose_time_diff_ns: int,
+) -> Tuple[Dict[str, Dict], Dict[str, int]]:
+    outputs: Dict[str, Dict] = {}
+    stats = {
+        "sequences": 0,
+        "camera_entries": 0,
+        "matched_frames": 0,
+        "missing_images": 0,
+        "pose_gap_skipped": 0,
+    }
+
+    for sequence_dir in sequence_dirs:
+        gt_timestamps, world_from_body = load_groundtruth(
+            sequence_dir / "mav0" / "state_groundtruth_estimate0" / "data.csv"
+        )
+        imu_csv = sequence_dir / "mav0" / "imu0" / "data.csv"
+        imu_data = load_imu_data(imu_csv) if imu_csv.is_file() else None
+
+        stats["sequences"] += 1
+        for camera_name in camera_names:
+            entry_key, payload, camera_stats = build_camera_annotation(
+                asl_dir=asl_dir,
+                dataset_name=dataset_name,
+                sequence_dir=sequence_dir,
+                camera_name=camera_name,
+                gt_timestamps=gt_timestamps,
+                world_from_body=world_from_body,
+                imu_data=imu_data,
+                max_pose_time_diff_ns=max_pose_time_diff_ns,
+            )
+            stats["matched_frames"] += camera_stats["matched_frames"]
+            stats["missing_images"] += camera_stats["missing_images"]
+            stats["pose_gap_skipped"] += camera_stats["pose_gap_skipped"]
+
+            if entry_key is None or payload is None:
+                continue
+
+            outputs[entry_key] = payload
+            stats["camera_entries"] += 1
+
+    return outputs, stats
 
 
 def build_split_annotations(
@@ -360,14 +424,15 @@ def build_split_annotations(
         stats["sequences"] += 1
         for camera_name in camera_names:
             sequence_name, payload, camera_stats = build_camera_annotation(
-                euroc_dir=euroc_dir,
+                asl_dir=euroc_dir,
+                dataset_name="euroc",
                 sequence_dir=sequence_dir,
                 camera_name=camera_name,
-                split=split,
                 gt_timestamps=gt_timestamps,
                 world_from_body=world_from_body,
                 imu_data=imu_data,
                 max_pose_time_diff_ns=max_pose_time_diff_ns,
+                split=split,
             )
             stats["matched_frames"] += camera_stats["matched_frames"]
             stats["missing_images"] += camera_stats["missing_images"]
@@ -437,15 +502,72 @@ def write_split_outputs(
     return manifest
 
 
+def write_sequence_outputs(
+    output_dir: Path,
+    annotation: Dict[str, Dict],
+    camera_names: Sequence[str],
+    max_pose_time_diff_ns: int,
+    dataset_name: Optional[str] = None,
+) -> Dict:
+    grouped: Dict[str, Dict[str, Dict]] = {}
+    for entry_key, payload in sorted(annotation.items()):
+        grouped.setdefault(payload["sequence_name"], {})[entry_key] = payload
+
+    sequence_records = {}
+    for sequence_name, sequence_payload in sorted(grouped.items()):
+        validate_vi_annotation(sequence_payload)
+        first_payload = next(iter(sequence_payload.values()))
+        sequence_path = first_payload["sequence_path"]
+        output_name = f"{sequence_path.replace('/', '__')}.jgz"
+        dump_jgz(output_dir / output_name, sequence_payload)
+
+        camera_list = sorted(payload["camera_name"] for payload in sequence_payload.values())
+        distortion_models = {
+            payload["camera_name"]: payload["sensor"].get(
+                "distortion_model", "radial-tangential"
+            )
+            for payload in sequence_payload.values()
+        }
+        frame_count = max(len(payload["frames"]) for payload in sequence_payload.values())
+        sequence_records[sequence_name] = {
+            "file": output_name,
+            "sequence_path": sequence_path,
+            "frame_count": int(frame_count),
+            "camera_names": camera_list,
+            "distortion_models": distortion_models,
+        }
+
+    if dataset_name is None:
+        first = next(iter(annotation.values()), {})
+        dataset_name = first.get("dataset", "asl")
+    manifest = build_sequence_manifest(
+        dataset=dataset_name,
+        sequence_records=sequence_records,
+        camera_names=camera_names,
+        max_pose_time_diff_ns=max_pose_time_diff_ns,
+    )
+    with open(output_dir / "sequence_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    with open(output_dir / "schema_version.json", "w", encoding="utf-8") as f:
+        json.dump({"schema_version": SCHEMA_VERSION}, f, indent=2)
+    return manifest
+
+
 def sequence_output_stem(euroc_dir: Path, sequence_dir: Path) -> str:
     return sequence_dir.relative_to(euroc_dir).as_posix().replace("/", "__")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate local EuRoC/ASL annotations compatible with VGGT training."
+        description="Generate local ASL/MAV VI annotations compatible with VGGT training."
     )
-    parser.add_argument("--euroc_dir", required=True, help="Path to local EuRoC root.")
+    parser.add_argument("--asl_dir", help="Path to a local ASL/MAV dataset root.")
+    parser.add_argument("--euroc_dir", help="Backward-compatible alias for --asl_dir.")
+    parser.add_argument(
+        "--dataset_name",
+        default="euroc",
+        help="Dataset name stored in annotations, e.g. euroc, tum_vi, kaist_vi, uma_vi.",
+    )
     parser.add_argument(
         "--output_dir", required=True, help="Directory to write generated *.jgz files."
     )
@@ -474,29 +596,42 @@ def main() -> None:
     parser.add_argument(
         "--output_mode",
         choices=["split", "per_sequence"],
-        default="split",
+        default="per_sequence",
         help=(
-            "Write unified euroc_train/val/test.jgz files by sequence split, "
-            "or legacy one-file-per-sequence annotations."
+            "Write one file per sequence, or legacy euroc_train/val/test.jgz files."
         ),
     )
     args = parser.parse_args()
 
-    euroc_dir = Path(args.euroc_dir).resolve()
+    asl_arg = args.asl_dir or args.euroc_dir
+    if not asl_arg:
+        parser.error("one of --asl_dir or --euroc_dir is required")
+    asl_dir = Path(asl_arg).resolve()
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    sequence_dirs = discover_sequences(euroc_dir)
+    sequence_dirs = discover_sequences(asl_dir)
 
-    annotation, total_stats = build_split_annotations(
-        euroc_dir=euroc_dir,
+    annotation, total_stats = build_asl_annotations(
+        asl_dir=asl_dir,
+        dataset_name=args.dataset_name,
         sequence_dirs=sequence_dirs,
         camera_names=args.camera_names,
         max_pose_time_diff_ns=args.max_pose_time_diff_ns,
-        split_sequences=EUROC_SPLIT_SEQUENCES,
     )
 
     if args.output_mode == "split":
+        if args.dataset_name != "euroc":
+            raise ValueError("--output_mode split is only supported for dataset_name=euroc")
+        for payload in annotation.values():
+            sequence_name = payload["sequence_name"]
+            split_roles = sequence_to_split_roles(
+                normalize_split_sequences(EUROC_SPLIT_SEQUENCES)
+            ).get(sequence_name, [])
+            if not split_roles:
+                raise ValueError(f"No EuRoC split configured for sequence {sequence_name}")
+            payload["split"] = split_roles[0]
+            payload["split_roles"] = list(split_roles)
         manifest = write_split_outputs(
             output_dir=output_dir,
             annotation=annotation,
@@ -510,7 +645,7 @@ def main() -> None:
             "schema_version": SCHEMA_VERSION,
             "camera_names": list(args.camera_names),
             "max_pose_time_diff_ns": args.max_pose_time_diff_ns,
-            "sequence_dirs": [p.relative_to(euroc_dir).as_posix() for p in sequence_dirs],
+            "sequence_dirs": [p.relative_to(asl_dir).as_posix() for p in sequence_dirs],
             "generated_files": [f"euroc_{split}.jgz" for split in SPLIT_NAMES],
             "total": total_stats,
             "split_manifest": manifest,
@@ -529,61 +664,34 @@ def main() -> None:
             )
         return
 
-    total_stats = {
-        "sequences": 0,
-        "camera_entries": 0,
-        "matched_frames": 0,
-        "missing_images": 0,
-        "pose_gap_skipped": 0,
-    }
-    generated_files = []
-    per_sequence_stats = {}
-    for sequence_dir in sequence_dirs:
-        sequence_key = sequence_dir.relative_to(euroc_dir).as_posix()
-        short_name = short_sequence_name(sequence_key)
-        sequence_payload = {
-            entry_key: payload
-            for entry_key, payload in annotation.items()
-            if payload["sequence_name"] == short_name
-        }
-        sequence_stats = {
-            "sequences": 1,
-            "camera_entries": len(sequence_payload),
-            "matched_frames": sum(len(payload["frames"]) for payload in sequence_payload.values()),
-            "missing_images": 0,
-            "pose_gap_skipped": sum(
-                payload.get("diagnostics", {}).get("num_missing_gt", 0)
-                for payload in sequence_payload.values()
-            ),
-        }
-        output_name = f"{sequence_output_stem(euroc_dir, sequence_dir)}.jgz"
-        dump_jgz(output_dir / output_name, sequence_payload)
-        generated_files.append(output_name)
-
-        per_sequence_stats[sequence_key] = {
-            "file": output_name,
-            "stats": sequence_stats,
-        }
-        for key in total_stats:
-            total_stats[key] += sequence_stats[key]
+    manifest = write_sequence_outputs(
+        output_dir=output_dir,
+        annotation=annotation,
+        camera_names=args.camera_names,
+        max_pose_time_diff_ns=args.max_pose_time_diff_ns,
+        dataset_name=args.dataset_name,
+    )
 
     summary = {
         "dataset_format": args.dataset_format,
         "output_mode": args.output_mode,
+        "dataset_name": args.dataset_name,
         "schema_version": SCHEMA_VERSION,
         "camera_names": list(args.camera_names),
         "max_pose_time_diff_ns": args.max_pose_time_diff_ns,
-        "sequence_dirs": [p.relative_to(euroc_dir).as_posix() for p in sequence_dirs],
-        "generated_files": generated_files,
+        "sequence_dirs": [p.relative_to(asl_dir).as_posix() for p in sequence_dirs],
+        "generated_files": [
+            record["file"] for record in manifest["sequences"].values()
+        ],
         "total": total_stats,
-        "per_sequence": per_sequence_stats,
+        "sequence_manifest": manifest,
     }
     with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
     print(f"Generated annotations under: {output_dir}")
     print(f"Discovered sequences: {len(sequence_dirs)}")
-    print(f"Generated sequence files: {len(generated_files)}")
+    print(f"Generated sequence files: {len(manifest['sequences'])}")
     print(f"Camera entries: {total_stats['camera_entries']}")
     print(f"Matched frames: {total_stats['matched_frames']}")
 

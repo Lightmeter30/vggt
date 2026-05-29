@@ -79,6 +79,7 @@ def _deserialize_sensor(sensor):
             sensor["undistorted_intrinsics"], dtype=np.float32
         ),
         "image_size": np.asarray(sensor["image_size"], dtype=np.int32),
+        "distortion_model": str(sensor.get("distortion_model", "radial-tangential")),
     }
 
 
@@ -146,13 +147,21 @@ def load_euroc_image_object(image_path, sensor, undistort_images):
         raise FileNotFoundError(f"Failed to read EuRoC image: {image_path}")
 
     if undistort_images:
-        image_bgr = cv2.undistort(
-            image_bgr,
-            sensor["intrinsics"],
-            sensor["distortion"],
-            None,
-            sensor["undistorted_intrinsics"],
-        )
+        if sensor.get("distortion_model") == "equidistant":
+            image_bgr = cv2.fisheye.undistortImage(
+                image_bgr,
+                sensor["intrinsics"],
+                sensor["distortion"].reshape(-1, 1),
+                Knew=sensor["undistorted_intrinsics"],
+            )
+        else:
+            image_bgr = cv2.undistort(
+                image_bgr,
+                sensor["intrinsics"],
+                sensor["distortion"],
+                None,
+                sensor["undistorted_intrinsics"],
+            )
 
     return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 

@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import cv2
@@ -24,6 +25,7 @@ from evaluation.datasets.asl.camera_pose import (
 from evaluation.datasets.euroc.camera_pose import (
     evaluate_euroc_variants,
     evaluate_sequences,
+    load_euroc_image_object,
     load_euroc_sequence_entries,
 )
 from evaluation.datasets.realestate10k.camera_pose import (
@@ -342,6 +344,24 @@ class TestEurocCameraPoseEvaluation(unittest.TestCase):
         )
 
         self.assertEqual(result["num_sequences"], 1)
+
+    def test_load_euroc_image_object_uses_fisheye_undistortion_for_equidistant_sensor(self):
+        image_path = self.euroc_dir / "fisheye.png"
+        _write_image(image_path, color=(80, 40, 20))
+        sensor = {
+            "intrinsics": np.asarray([[40.0, 0.0, 16.0], [0.0, 40.0, 16.0], [0.0, 0.0, 1.0]], dtype=np.float32),
+            "distortion": np.asarray([0.01, -0.001, 0.0001, 0.0], dtype=np.float32),
+            "undistorted_intrinsics": np.asarray([[38.0, 0.0, 16.0], [0.0, 38.0, 16.0], [0.0, 0.0, 1.0]], dtype=np.float32),
+            "image_size": np.asarray([32, 32], dtype=np.int32),
+            "distortion_model": "equidistant",
+        }
+
+        with mock.patch("cv2.fisheye.undistortImage", side_effect=lambda image, *args, **kwargs: image) as undistort:
+            image = load_euroc_image_object(str(image_path), sensor, undistort_images=True)
+
+        self.assertEqual(image.shape, (32, 32, 3))
+        self.assertTrue(undistort.called)
+
 
 class TestASLCameraPoseEvaluation(unittest.TestCase):
     def setUp(self):

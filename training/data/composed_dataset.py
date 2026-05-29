@@ -159,13 +159,6 @@ class ComposedDataset(Dataset, ABC):
                 np.asarray(batch["timestamps_ns"], dtype=np.int64)
             )
 
-        if "degradation_labels" in batch:
-            sample["degradation_labels"] = list(batch["degradation_labels"])
-            sample["degradation_label_ids"] = torch.from_numpy(
-                np.asarray(batch["degradation_label_ids"], dtype=np.int64)
-            )
-            sample["degradation_params"] = list(batch["degradation_params"])
-
         # --- Track Processing (if enabled) ---
         if self.load_track:
             if batch["tracks"] is not None:

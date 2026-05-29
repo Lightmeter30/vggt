@@ -14,6 +14,40 @@ max_img_per_gpu: 8
 limit_train_batches: 2
 limit_val_batches: 1
 
+vi_datasets:
+  euroc:
+    dataset_name: euroc
+    ASL_DIR: /home/zwr/code/my-vggt/dataset/euRoC
+    ASL_ANNOTATION_DIR: /home/zwr/code/my-vggt/dataset/euroc-anno-local
+    camera_names: [cam0]
+  tum_vi:
+    dataset_name: tum_vi
+    ASL_DIR: /home/zwr/code/my-vggt/dataset/TUM_VI
+    ASL_ANNOTATION_DIR: /home/zwr/code/my-vggt/dataset/tum-vi-anno-local
+    camera_names: [cam0]
+  kaist_vi:
+    dataset_name: kaist_vi
+    ASL_DIR: /home/zwr/code/my-vggt/dataset/KAIST_VI
+    ASL_ANNOTATION_DIR: /home/zwr/code/my-vggt/dataset/kaist-vi-anno-local
+    camera_names: [cam0]
+  uma_vi:
+    dataset_name: uma_vi
+    ASL_DIR: /home/zwr/code/my-vggt/dataset/UMA_VI
+    ASL_ANNOTATION_DIR: /home/zwr/code/my-vggt/dataset/uma-vi-anno-local
+    camera_names: [cam0, cam1, cam2, cam3]
+
+sequence_splits:
+  train:
+    euroc: [MH_01_easy, MH_02_easy, MH_03_medium, MH_04_difficult, V1_02_medium, V1_03_difficult, V2_01_easy, V2_03_difficult]
+    tum_vi: []
+    kaist_vi: []
+    uma_vi: []
+  val:
+    euroc: [MH_05_difficult, V1_01_easy, V2_02_medium]
+    tum_vi: []
+    kaist_vi: []
+    uma_vi: []
+
 data:
   train:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
@@ -27,12 +61,37 @@ data:
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
-        - _target_: data.datasets.euroc.EurocDataset
+        - _target_: data.datasets.asl.ASLDataset
           split: train
-          EUROC_DIR: /home/zwr/code/my-vggt/dataset/euRoC
-          EUROC_ANNOTATION_DIR: /home/zwr/code/my-vggt/dataset/euroc-anno-local
-          camera_names:
-            - cam0
+          dataset_name: ${vi_datasets.euroc.dataset_name}
+          ASL_DIR: ${vi_datasets.euroc.ASL_DIR}
+          ASL_ANNOTATION_DIR: ${vi_datasets.euroc.ASL_ANNOTATION_DIR}
+          camera_names: ${vi_datasets.euroc.camera_names}
+          sequence_names: ${sequence_splits.train.euroc}
+          load_imu: False
+        - _target_: data.datasets.asl.ASLDataset
+          split: train
+          dataset_name: ${vi_datasets.tum_vi.dataset_name}
+          ASL_DIR: ${vi_datasets.tum_vi.ASL_DIR}
+          ASL_ANNOTATION_DIR: ${vi_datasets.tum_vi.ASL_ANNOTATION_DIR}
+          camera_names: ${vi_datasets.tum_vi.camera_names}
+          sequence_names: ${sequence_splits.train.tum_vi}
+          load_imu: False
+        - _target_: data.datasets.asl.ASLDataset
+          split: train
+          dataset_name: ${vi_datasets.kaist_vi.dataset_name}
+          ASL_DIR: ${vi_datasets.kaist_vi.ASL_DIR}
+          ASL_ANNOTATION_DIR: ${vi_datasets.kaist_vi.ASL_ANNOTATION_DIR}
+          camera_names: ${vi_datasets.kaist_vi.camera_names}
+          sequence_names: ${sequence_splits.train.kaist_vi}
+          load_imu: False
+        - _target_: data.datasets.asl.ASLDataset
+          split: train
+          dataset_name: ${vi_datasets.uma_vi.dataset_name}
+          ASL_DIR: ${vi_datasets.uma_vi.ASL_DIR}
+          ASL_ANNOTATION_DIR: ${vi_datasets.uma_vi.ASL_ANNOTATION_DIR}
+          camera_names: ${vi_datasets.uma_vi.camera_names}
+          sequence_names: ${sequence_splits.train.uma_vi}
           load_imu: False
   val:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
@@ -45,12 +104,37 @@ data:
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
-        - _target_: data.datasets.euroc.EurocDataset
+        - _target_: data.datasets.asl.ASLDataset
           split: val
-          EUROC_DIR: /home/zwr/code/my-vggt/dataset/euRoC
-          EUROC_ANNOTATION_DIR: /home/zwr/code/my-vggt/dataset/euroc-anno-local
-          camera_names:
-            - cam0
+          dataset_name: ${vi_datasets.euroc.dataset_name}
+          ASL_DIR: ${vi_datasets.euroc.ASL_DIR}
+          ASL_ANNOTATION_DIR: ${vi_datasets.euroc.ASL_ANNOTATION_DIR}
+          camera_names: ${vi_datasets.euroc.camera_names}
+          sequence_names: ${sequence_splits.val.euroc}
+          load_imu: False
+        - _target_: data.datasets.asl.ASLDataset
+          split: val
+          dataset_name: ${vi_datasets.tum_vi.dataset_name}
+          ASL_DIR: ${vi_datasets.tum_vi.ASL_DIR}
+          ASL_ANNOTATION_DIR: ${vi_datasets.tum_vi.ASL_ANNOTATION_DIR}
+          camera_names: ${vi_datasets.tum_vi.camera_names}
+          sequence_names: ${sequence_splits.val.tum_vi}
+          load_imu: False
+        - _target_: data.datasets.asl.ASLDataset
+          split: val
+          dataset_name: ${vi_datasets.kaist_vi.dataset_name}
+          ASL_DIR: ${vi_datasets.kaist_vi.ASL_DIR}
+          ASL_ANNOTATION_DIR: ${vi_datasets.kaist_vi.ASL_ANNOTATION_DIR}
+          camera_names: ${vi_datasets.kaist_vi.camera_names}
+          sequence_names: ${sequence_splits.val.kaist_vi}
+          load_imu: False
+        - _target_: data.datasets.asl.ASLDataset
+          split: val
+          dataset_name: ${vi_datasets.uma_vi.dataset_name}
+          ASL_DIR: ${vi_datasets.uma_vi.ASL_DIR}
+          ASL_ANNOTATION_DIR: ${vi_datasets.uma_vi.ASL_ANNOTATION_DIR}
+          camera_names: ${vi_datasets.uma_vi.camera_names}
+          sequence_names: ${sequence_splits.val.uma_vi}
           load_imu: False
 
 logging:
@@ -155,4 +239,3 @@ cuda:
   cudnn_deterministic: False
   cudnn_benchmark: False
   allow_tf32: True
-

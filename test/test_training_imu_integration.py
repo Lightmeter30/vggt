@@ -29,7 +29,7 @@ class DummyLoss(nn.Module):
         return {"objective": predictions["dummy"] * 0.0}
 
 
-def test_trainer_step_passes_optional_imu_and_degradation_fields():
+def test_trainer_step_passes_optional_imu_fields_without_degradation_metadata():
     trainer = object.__new__(Trainer)
     trainer.loss = DummyLoss()
     trainer.steps = {"train": 0}
@@ -41,7 +41,6 @@ def test_trainer_step_passes_optional_imu_and_degradation_fields():
         "images": torch.randn(2, 3, 3, 14, 14),
         "imu_windows": torch.randn(2, 3, 5, 6),
         "imu_window_masks": torch.ones(2, 3, 5, dtype=torch.bool),
-        "degradation_metadata": [["clean"] * 3] * 2,
     }
 
     trainer._step(batch, model, "train", {})
@@ -49,7 +48,7 @@ def test_trainer_step_passes_optional_imu_and_degradation_fields():
     assert model.received_kwargs["images"] is batch["images"]
     assert model.received_kwargs["imu_windows"] is batch["imu_windows"]
     assert model.received_kwargs["imu_window_masks"] is batch["imu_window_masks"]
-    assert model.received_kwargs["degradation_metadata"] is batch["degradation_metadata"]
+    assert "degradation_metadata" not in model.received_kwargs
 
 
 def test_load_checkpoint_in_val_mode_ignores_optimizer_state(tmp_path):

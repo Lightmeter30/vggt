@@ -27,10 +27,11 @@ data:
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
-        - _target_: data.datasets.euroc.EurocDataset
+        - _target_: data.datasets.asl.ASLDataset
           split: train
-          EUROC_DIR: /home/zwr/code/my-vggt/dataset/euRoC
-          EUROC_ANNOTATION_DIR: /home/zwr/code/my-vggt/dataset/euroc-anno-local
+          dataset_name: euroc
+          ASL_DIR: /home/zwr/code/my-vggt/dataset/euRoC
+          ASL_ANNOTATION_DIR: /home/zwr/code/my-vggt/dataset/euroc-anno-local
           camera_names:
             - cam0
           load_imu: False
@@ -45,10 +46,11 @@ data:
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
-        - _target_: data.datasets.euroc.EurocDataset
+        - _target_: data.datasets.asl.ASLDataset
           split: val
-          EUROC_DIR: /home/zwr/code/my-vggt/dataset/euRoC
-          EUROC_ANNOTATION_DIR: /home/zwr/code/my-vggt/dataset/euroc-anno-local
+          dataset_name: euroc
+          ASL_DIR: /home/zwr/code/my-vggt/dataset/euRoC
+          ASL_ANNOTATION_DIR: /home/zwr/code/my-vggt/dataset/euroc-anno-local
           camera_names:
             - cam0
           load_imu: False

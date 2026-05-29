@@ -751,10 +751,6 @@ class Trainer:
         for batch_key in ("imu_windows", "imu_window_masks"):
             if batch_key in batch:
                 model_kwargs[batch_key] = batch[batch_key]
-        if "degradation_metadata" in batch:
-            model_kwargs["degradation_metadata"] = batch["degradation_metadata"]
-        elif "degradation_params" in batch:
-            model_kwargs["degradation_metadata"] = batch["degradation_params"]
 
         y_hat = model(**model_kwargs)
         if "motion_risk" in y_hat:

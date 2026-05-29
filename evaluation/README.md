@@ -57,8 +57,6 @@ EuRoC 可选参数：
 - `--min_num_images 24`
 - `--fast_eval`
 - `--no-undistort`
-- `--degraded_dir /path/to/degraded/euroc`：先评 clean，再按 `degradation_metadata.jsonl` 评固定退化图像。
-- `--degradation_settings motion_blur_medium exposure_medium mixed_medium`：只评指定退化设置。
 - `--use_imu`：从 EuRoC annotation 构造 IMU window，供 IMU-FiLM checkpoint 使用。
 - `--metrics_output_dir evaluation/results`：写出 EuRoC 指标报告。
 

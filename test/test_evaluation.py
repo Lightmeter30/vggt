@@ -19,9 +19,7 @@ from evaluation.common.metrics import calculate_auc_np, se3_to_relative_pose_err
 from evaluation.datasets.euroc.camera_pose import (
     evaluate_euroc_variants,
     evaluate_sequences,
-    load_degradation_mappings,
     load_euroc_sequence_entries,
-    remap_euroc_annotation,
 )
 from evaluation.datasets.realestate10k.camera_pose import (
     add_arguments as add_realestate10k_arguments,
@@ -222,87 +220,11 @@ class TestEurocCameraPoseEvaluation(unittest.TestCase):
         self.assertAlmostEqual(result["AUC@5"], 1.0)
         self.assertAlmostEqual(result["AUC@3"], 1.0)
 
-    def test_remap_euroc_annotation_uses_degraded_paths(self):
-        raw_annotation = {
-            "machine_hall/MH_01_easy:cam0": _make_sequence_payload(
-                "cam0",
-                [
-                    "machine_hall/MH_01_easy/mav0/cam0/data/1.png",
-                    "machine_hall/MH_01_easy/mav0/cam0/data/2.png",
-                ],
-                [0.0, 1.0],
-            )
-        }
-        mapping = {
-            "machine_hall/MH_01_easy/mav0/cam0/data/1.png": "motion_blur_medium/MH_01_easy/cam0/1.png",
-            "machine_hall/MH_01_easy/mav0/cam0/data/2.png": "motion_blur_medium/MH_01_easy/cam0/2.png",
-        }
-
-        remapped = remap_euroc_annotation(raw_annotation, mapping, setting="motion_blur_medium")
-
-        frames = remapped["machine_hall/MH_01_easy:cam0"]["frames"]
-        self.assertEqual(frames[0]["image_rel_path"], "motion_blur_medium/MH_01_easy/cam0/1.png")
-        self.assertEqual(
-            frames[0]["clean_image_rel_path"],
-            "machine_hall/MH_01_easy/mav0/cam0/data/1.png",
-        )
-        self.assertEqual(frames[0]["degradation"]["setting"], "motion_blur_medium")
-        self.assertEqual(
-            raw_annotation["machine_hall/MH_01_easy:cam0"]["frames"][0]["image_rel_path"],
-            "machine_hall/MH_01_easy/mav0/cam0/data/1.png",
-        )
-
-    def test_load_degradation_mappings_validates_degraded_images(self):
-        degraded_dir = self.root / "degraded_test"
-        missing_degraded_path = "motion_blur_medium/MH_01_easy/cam0/1.png"
-        metadata_path = degraded_dir / "degradation_metadata.jsonl"
-        metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        metadata_path.write_text(
-            json.dumps(
-                {
-                    "setting": "motion_blur_medium",
-                    "clean_image_rel_path": "machine_hall/MH_01_easy/mav0/cam0/data/1.png",
-                    "degraded_image_rel_path": missing_degraded_path,
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-
-        with self.assertRaisesRegex(FileNotFoundError, missing_degraded_path):
-            load_degradation_mappings(degraded_dir)
-
-    def test_evaluate_euroc_variants_runs_clean_and_degraded_settings(self):
-        frame_paths = [
-            "machine_hall/MH_01_easy/mav0/cam0/data/1.png",
-            "machine_hall/MH_01_easy/mav0/cam0/data/2.png",
-            "machine_hall/MH_01_easy/mav0/cam0/data/3.png",
-        ]
-        settings = ["exposure_medium", "mixed_medium", "motion_blur_medium"]
-        degraded_dir = self.root / "degraded_test"
-        metadata_rows = []
-        for setting in settings:
-            for idx, frame_path in enumerate(frame_paths):
-                degraded_rel_path = f"{setting}/MH_01_easy/cam0/{idx + 1}.png"
-                _write_image(degraded_dir / degraded_rel_path, color=(100 + idx, 30, 40))
-                metadata_rows.append(
-                    {
-                        "setting": setting,
-                        "clean_image_rel_path": frame_path,
-                        "degraded_image_rel_path": degraded_rel_path,
-                    }
-                )
-        with (degraded_dir / "degradation_metadata.jsonl").open("w", encoding="utf-8") as fout:
-            for row in metadata_rows:
-                fout.write(json.dumps(row) + "\n")
-
+    def test_evaluate_euroc_variants_runs_clean_only(self):
         args = SimpleNamespace(
             split="test",
             euroc_dir=str(self.euroc_dir),
             euroc_anno_dir=str(self.anno_dir),
-            degraded_dir=str(degraded_dir),
-            degradation_metadata_path=None,
-            degradation_settings=None,
             camera_names=("cam0",),
             min_num_images=2,
             num_frames=3,
@@ -325,10 +247,7 @@ class TestEurocCameraPoseEvaluation(unittest.TestCase):
             predictor=predictor,
         )
 
-        self.assertEqual(
-            list(results.keys()),
-            ["clean", "exposure_medium", "mixed_medium", "motion_blur_medium"],
-        )
+        self.assertEqual(list(results.keys()), ["clean"])
         for result in results.values():
             self.assertEqual(result["num_sequences"], 1)
             self.assertAlmostEqual(result["AUC@30"], 1.0)

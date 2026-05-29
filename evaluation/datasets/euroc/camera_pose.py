@@ -1,6 +1,4 @@
-import copy
 from datetime import datetime
-import json
 import os
 from pathlib import Path
 import random
@@ -22,24 +20,6 @@ def add_arguments(parser):
     parser.add_argument("--min_num_images", type=int, default=24, help="Minimum images required for a sequence.")
     parser.add_argument("--euroc_dir", type=str, required=True, help="Path to the EuRoC dataset root.")
     parser.add_argument("--euroc_anno_dir", type=str, required=True, help="Path to EuRoC annotations.")
-    parser.add_argument(
-        "--degraded_dir",
-        type=str,
-        default=None,
-        help="Optional fixed degraded EuRoC test root. When set, clean is evaluated first, followed by degraded settings.",
-    )
-    parser.add_argument(
-        "--degradation_settings",
-        nargs="+",
-        default=None,
-        help="Optional degraded settings to evaluate. Defaults to all settings found in degradation_metadata.jsonl.",
-    )
-    parser.add_argument(
-        "--degradation_metadata_path",
-        type=str,
-        default=None,
-        help="Optional path to degradation_metadata.jsonl. Defaults to <degraded_dir>/degradation_metadata.jsonl.",
-    )
     parser.add_argument(
         "--metrics_output_dir",
         type=str,
@@ -158,83 +138,6 @@ def load_euroc_sequence_entries(annotation_path, euroc_dir, camera_names, min_nu
         camera_names=camera_names,
         min_num_images=min_num_images,
     )
-
-
-def load_degradation_mappings(
-    degraded_dir,
-    metadata_path=None,
-    settings=None,
-    validate_files=True,
-):
-    degraded_dir = Path(degraded_dir)
-    metadata_path = Path(metadata_path) if metadata_path else degraded_dir / "degradation_metadata.jsonl"
-    if not metadata_path.is_file():
-        raise FileNotFoundError(f"Missing degradation metadata: {metadata_path}")
-
-    settings_filter = set(settings or [])
-    mappings = {}
-
-    with metadata_path.open("r", encoding="utf-8") as fin:
-        for line_number, line in enumerate(fin, start=1):
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            setting = record["setting"]
-            if settings_filter and setting not in settings_filter:
-                continue
-
-            clean_rel_path = record["clean_image_rel_path"]
-            degraded_rel_path = record["degraded_image_rel_path"]
-            if validate_files:
-                degraded_path = degraded_dir / degraded_rel_path
-                if not degraded_path.is_file():
-                    raise FileNotFoundError(
-                        f"Missing degraded image for {setting} at line {line_number}: "
-                        f"{degraded_path}"
-                    )
-
-            setting_mapping = mappings.setdefault(setting, {})
-            previous = setting_mapping.get(clean_rel_path)
-            if previous is not None and previous != degraded_rel_path:
-                raise ValueError(
-                    f"Conflicting degraded mapping for {clean_rel_path} in {setting}: "
-                    f"{previous} vs {degraded_rel_path}"
-                )
-            setting_mapping[clean_rel_path] = degraded_rel_path
-
-    missing_settings = settings_filter.difference(mappings.keys())
-    if missing_settings:
-        missing = ", ".join(sorted(missing_settings))
-        raise ValueError(f"Missing degradation settings in metadata: {missing}")
-
-    return {setting: mappings[setting] for setting in sorted(mappings)}
-
-
-def remap_euroc_annotation(raw_annotation, path_mapping, setting):
-    remapped = copy.deepcopy(raw_annotation)
-    missing_paths = []
-
-    for payload in remapped.values():
-        for frame in payload["frames"]:
-            clean_rel_path = frame.get("clean_image_rel_path", frame["image_rel_path"])
-            degraded_rel_path = path_mapping.get(clean_rel_path)
-            if degraded_rel_path is None:
-                missing_paths.append(clean_rel_path)
-                continue
-
-            frame["clean_image_rel_path"] = clean_rel_path
-            frame["image_rel_path"] = degraded_rel_path
-            frame["degradation"] = {
-                "setting": setting,
-                "variant_id": setting,
-                "metadata_rel_path": "degradation_metadata.jsonl",
-            }
-
-    if missing_paths:
-        preview = ", ".join(sorted(set(missing_paths))[:3])
-        raise KeyError(f"Missing degraded mapping for {len(missing_paths)} frames: {preview}")
-
-    return remapped
 
 
 def load_euroc_image_object(image_path, sensor, undistort_images):
@@ -557,35 +460,6 @@ def evaluate_euroc_variants(args, model, device, dtype, predictor=None):
         )
     }
 
-    if not getattr(args, "degraded_dir", None):
-        return variant_results
-
-    degradation_mappings = load_degradation_mappings(
-        degraded_dir=args.degraded_dir,
-        metadata_path=getattr(args, "degradation_metadata_path", None),
-        settings=getattr(args, "degradation_settings", None),
-    )
-    for setting, path_mapping in degradation_mappings.items():
-        remapped_annotation = remap_euroc_annotation(
-            raw_annotation=raw_annotation,
-            path_mapping=path_mapping,
-            setting=setting,
-        )
-        degraded_entries = _build_euroc_sequence_entries(
-            raw_annotation=remapped_annotation,
-            euroc_dir=args.degraded_dir,
-            camera_names=tuple(args.camera_names),
-            min_num_images=args.min_num_images,
-        )
-        variant_results[setting] = _evaluate_sequence_entries(
-            args=args,
-            model=model,
-            device=device,
-            dtype=dtype,
-            sequence_entries=degraded_entries,
-            predictor=predictor,
-        )
-
     return variant_results
 
 
@@ -637,8 +511,6 @@ def write_euroc_metrics_report(args, variant_results):
         f"split: {args.split}",
         f"euroc_dir: {args.euroc_dir}",
         f"euroc_anno_dir: {args.euroc_anno_dir}",
-        f"degraded_dir: {getattr(args, 'degraded_dir', None)}",
-        f"degradation_settings: {getattr(args, 'degradation_settings', None)}",
         f"use_imu: {getattr(args, 'use_imu', False)}",
         f"imu_window_ns: {getattr(args, 'imu_window_ns', None)}",
         f"imu_num_samples: {getattr(args, 'imu_num_samples', None)}",

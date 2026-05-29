@@ -11,6 +11,7 @@
 
 ## 支持任务
 
+- `asl / camera_pose`
 - `co3d / camera_pose`
 - `euroc / camera_pose`
 - `realestate10k / camera_pose`
@@ -121,6 +122,16 @@ EuRoC IMU-FiLM 评测可追加：
 
 - `--use_imu` 会从 EuRoC annotation 构造 IMU window 并传给模型；IMU-FiLM checkpoint 会按 state dict 自动构造对应模型。
 - EuRoC metrics report 默认写入 `evaluation/results/`，该目录为本地产物。
+
+ASL / VI 多数据集评测：
+
+```bash
+conda run -n my_vggt_relocation python evaluation/main.py \
+    --config evaluation/config/asl_vi_camera_pose.yaml
+```
+
+- `asl / camera_pose` 读取训练侧 `vi_pose_v1` 标注和 `sequence_manifest.json`，不直接解析 KAIST/UMA/TUM 原始格式。
+- YAML 的 `datasets[].sequence_names: []` 表示跳过该数据集；命令行可覆盖 `--model_path`、`--seed`、`--device`。
 
 ## 规则
 

@@ -4,6 +4,7 @@
 
 当前支持：
 
+- `asl / camera_pose`
 - `co3d / camera_pose`
 - `euroc / camera_pose`
 - `realestate10k / camera_pose`
@@ -59,6 +60,27 @@ EuRoC 可选参数：
 - `--no-undistort`
 - `--use_imu`：从 EuRoC annotation 构造 IMU window，供 IMU-FiLM checkpoint 使用。
 - `--metrics_output_dir evaluation/results`：写出 EuRoC 指标报告。
+
+### ASL / VI 多数据集
+
+`asl / camera_pose` 复用训练侧 `vi_pose_v1` 标注，适用于 EuRoC、TUM-VI、KAIST-VI、UMA-VI
+这类 ASL/MAV 目录已完成预处理后的评测。先用对应预处理脚本生成 `sequence_manifest.json`
+和 per-sequence `.jgz`，再通过 YAML 指定参与评测的数据集和 sequence：
+
+```bash
+conda run -n my_vggt_relocation python evaluation/main.py \
+    --config evaluation/config/asl_vi_camera_pose.yaml
+```
+
+YAML 中每个 `datasets` 条目包含：
+
+- `name`：`euroc`、`tum_vi`、`kaist_vi`、`uma_vi` 等数据集名。
+- `data_root`：原始图像根目录。
+- `annotation_dir`：`vi_pose_v1` 标注目录。
+- `camera_names`：要评测的相机。
+- `sequence_names`：要评测的 sequence；空列表表示跳过该数据集。
+
+可在命令行覆盖 YAML 中的 `--model_path`、`--seed`、`--device` 等基础参数。
 
 ### RealEstate10K
 

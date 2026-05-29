@@ -1,0 +1,39 @@
+task: camera_pose
+model_path: /home/zwr/code/my-vggt/ckpt/model.pt
+seed: 0
+device: null
+
+split: test
+num_frames: 10
+min_num_images: 24
+fast_eval: false
+undistort_images: true
+
+use_imu: false
+imu_window_ns: 100000000
+imu_num_samples: 32
+imu_feature_order: gyro_accel
+
+metrics_output_dir: evaluation/results
+
+datasets:
+  - name: euroc
+    data_root: /home/zwr/code/my-vggt/dataset/euRoC
+    annotation_dir: /home/zwr/code/my-vggt/dataset/euroc-anno-local
+    camera_names: [cam0]
+    sequence_names: [MH_05_difficult, V1_01_easy, V2_02_medium]
+  - name: tum_vi
+    data_root: /home/zwr/code/my-vggt/dataset/TUM_VI
+    annotation_dir: /home/zwr/code/my-vggt/dataset/tum-vi-anno-local
+    camera_names: [cam0]
+    sequence_names: []
+  - name: kaist_vi
+    data_root: /home/zwr/code/my-vggt/dataset/KAIST_VI
+    annotation_dir: /home/zwr/code/my-vggt/dataset/kaist-vi-anno-local
+    camera_names: [cam0]
+    sequence_names: []
+  - name: uma_vi
+    data_root: /home/zwr/code/my-vggt/dataset/UMA_VI
+    annotation_dir: /home/zwr/code/my-vggt/dataset/uma-vi-anno-local
+    camera_names: [cam0, cam1, cam2, cam3]
+    sequence_names: []

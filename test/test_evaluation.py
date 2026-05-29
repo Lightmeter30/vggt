@@ -16,6 +16,11 @@ from vggt.utils.load_fn import load_and_preprocess_images_from_objects
 from evaluation.common.model import _extract_state_dict, _strip_state_dict_prefixes
 from evaluation.common.model import build_model_from_state_dict
 from evaluation.common.metrics import calculate_auc_np, se3_to_relative_pose_error
+from evaluation.main import parse_args
+from evaluation.datasets.asl.camera_pose import (
+    evaluate_asl_datasets,
+    load_asl_sequence_entries,
+)
 from evaluation.datasets.euroc.camera_pose import (
     evaluate_euroc_variants,
     evaluate_sequences,
@@ -84,6 +89,38 @@ def _make_sequence_payload(camera_name: str, frame_paths: list[str], tx_values: 
         ],
         "imu_data": None,
     }
+
+
+def _write_sequence_manifest_annotation(
+    annotation_dir: Path,
+    dataset_name: str,
+    sequence_name: str,
+    sequence_path: str,
+    camera_names: list[str],
+    payload_by_key: dict,
+) -> None:
+    annotation_dir.mkdir(parents=True, exist_ok=True)
+    annotation_file = f"{sequence_name}.jgz"
+    with gzip.open(annotation_dir / annotation_file, "wt", encoding="utf-8") as fout:
+        json.dump(payload_by_key, fout)
+    manifest = {
+        "schema_version": "vi_pose_v1",
+        "dataset": dataset_name,
+        "split_policy": "configured_in_training",
+        "camera_names": camera_names,
+        "max_pose_time_diff_ns": 10_000_000,
+        "sequences": {
+            sequence_name: {
+                "file": annotation_file,
+                "sequence_path": sequence_path,
+                "frame_count": len(next(iter(payload_by_key.values()))["frames"]),
+                "camera_names": camera_names,
+            }
+        },
+    }
+    (annotation_dir / "sequence_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
 
 
 class TestLoadAndPreprocessImagesFromObjects(unittest.TestCase):
@@ -305,6 +342,257 @@ class TestEurocCameraPoseEvaluation(unittest.TestCase):
         )
 
         self.assertEqual(result["num_sequences"], 1)
+
+class TestASLCameraPoseEvaluation(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.euroc_dir = self.root / "euroc"
+        self.uma_dir = self.root / "uma_vi"
+        self.euroc_anno_dir = self.root / "euroc_anno"
+        self.uma_anno_dir = self.root / "uma_anno"
+
+        self.euroc_frames = [
+            "machine_hall/MH_05_difficult/mav0/cam0/data/1.png",
+            "machine_hall/MH_05_difficult/mav0/cam0/data/2.png",
+            "machine_hall/MH_05_difficult/mav0/cam0/data/3.png",
+        ]
+        self.uma_frames = [
+            "corridor_01/mav0/cam0/data/1.png",
+            "corridor_01/mav0/cam0/data/2.png",
+            "corridor_01/mav0/cam0/data/3.png",
+        ]
+        for idx, frame_path in enumerate(self.euroc_frames):
+            _write_image(self.euroc_dir / frame_path, color=(idx * 10, 20, 30))
+        for idx, frame_path in enumerate(self.uma_frames):
+            _write_image(self.uma_dir / frame_path, color=(idx * 30, 50, 70))
+
+        euroc_payload = {
+            "euroc/MH_05_difficult/cam0": _make_sequence_payload(
+                "cam0", self.euroc_frames, [0.0, 1.0, 2.0]
+            )
+        }
+        uma_payload = {
+            "uma_vi/corridor_01/cam0": _make_sequence_payload(
+                "cam0", self.uma_frames, [0.0, 1.5, 3.0]
+            )
+        }
+        _write_sequence_manifest_annotation(
+            self.euroc_anno_dir,
+            dataset_name="euroc",
+            sequence_name="MH_05_difficult",
+            sequence_path="machine_hall/MH_05_difficult",
+            camera_names=["cam0"],
+            payload_by_key=euroc_payload,
+        )
+        _write_sequence_manifest_annotation(
+            self.uma_anno_dir,
+            dataset_name="uma_vi",
+            sequence_name="corridor_01",
+            sequence_path="corridor_01",
+            camera_names=["cam0"],
+            payload_by_key=uma_payload,
+        )
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_parse_args_loads_asl_yaml_config_without_long_cli(self):
+        config_path = self.root / "eval.yaml"
+        config_path.write_text(
+            "\n".join(
+                [
+                    "task: camera_pose",
+                    "model_path: /tmp/model.pt",
+                    "seed: 7",
+                    "num_frames: 3",
+                    "min_num_images: 2",
+                    "metrics_output_dir: evaluation/results",
+                    "datasets:",
+                    "  - name: euroc",
+                    f"    data_root: {self.euroc_dir}",
+                    f"    annotation_dir: {self.euroc_anno_dir}",
+                    "    camera_names: [cam0]",
+                    "    sequence_names: [MH_05_difficult]",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        args = parse_args(["--config", str(config_path)])
+
+        self.assertEqual(args.dataset, "asl")
+        self.assertEqual(args.task, "camera_pose")
+        self.assertEqual(args.model_path, "/tmp/model.pt")
+        self.assertEqual(args.seed, 7)
+        self.assertEqual(args.num_frames, 3)
+        self.assertEqual(args.datasets[0]["name"], "euroc")
+        self.assertEqual(args.datasets[0]["sequence_names"], ["MH_05_difficult"])
+
+    def test_parse_args_cli_values_override_yaml_config(self):
+        config_path = self.root / "eval_override.yaml"
+        config_path.write_text(
+            "\n".join(
+                [
+                    "task: camera_pose",
+                    "model_path: /tmp/model_from_yaml.pt",
+                    "seed: 7",
+                    "num_frames: 3",
+                    "datasets:",
+                    "  - name: euroc",
+                    f"    data_root: {self.euroc_dir}",
+                    f"    annotation_dir: {self.euroc_anno_dir}",
+                    "    camera_names: [cam0]",
+                    "    sequence_names: [MH_05_difficult]",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        args = parse_args(
+            [
+                "--config",
+                str(config_path),
+                "--model_path",
+                "/tmp/model_from_cli.pt",
+                "--seed",
+                "11",
+            ]
+        )
+
+        self.assertEqual(args.model_path, "/tmp/model_from_cli.pt")
+        self.assertEqual(args.seed, 11)
+
+    def test_load_asl_sequence_entries_uses_sequence_manifest_and_filters_requested_sequences(self):
+        entries = load_asl_sequence_entries(
+            dataset_name="uma_vi",
+            data_root=self.uma_dir,
+            annotation_dir=self.uma_anno_dir,
+            sequence_names=("corridor_01",),
+            camera_names=("cam0",),
+            min_num_images=2,
+            split="test",
+        )
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["seq_name"], "uma_vi/corridor_01/cam0")
+        self.assertEqual(entries[0]["image_root"], str(self.uma_dir))
+        self.assertEqual(entries[0]["frames"][0]["image_path"], str(self.uma_dir / self.uma_frames[0]))
+
+    def test_load_asl_sequence_entries_falls_back_to_legacy_split_annotation(self):
+        legacy_dir = self.root / "legacy_anno"
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "custom_vi/seq_a/cam0": _make_sequence_payload(
+                "cam0", self.uma_frames, [0.0, 1.0, 2.0]
+            )
+        }
+        with gzip.open(legacy_dir / "custom_vi_test.jgz", "wt", encoding="utf-8") as fout:
+            json.dump(payload, fout)
+
+        entries = load_asl_sequence_entries(
+            dataset_name="custom_vi",
+            data_root=self.uma_dir,
+            annotation_dir=legacy_dir,
+            camera_names=("cam0",),
+            min_num_images=2,
+            split="test",
+        )
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["seq_name"], "custom_vi/seq_a/cam0")
+
+    def test_evaluate_asl_datasets_returns_grouped_results_for_multiple_datasets(self):
+        args = SimpleNamespace(
+            datasets=[
+                {
+                    "name": "euroc",
+                    "data_root": str(self.euroc_dir),
+                    "annotation_dir": str(self.euroc_anno_dir),
+                    "camera_names": ["cam0"],
+                    "sequence_names": ["MH_05_difficult"],
+                },
+                {
+                    "name": "uma_vi",
+                    "data_root": str(self.uma_dir),
+                    "annotation_dir": str(self.uma_anno_dir),
+                    "camera_names": ["cam0"],
+                    "sequence_names": ["corridor_01"],
+                },
+            ],
+            split="test",
+            min_num_images=2,
+            num_frames=3,
+            fast_eval=False,
+            seed=0,
+            no_undistort=True,
+            use_imu=False,
+        )
+
+        def predictor(model, image_paths, image_objects, frame_entries, device, dtype):
+            del model, image_paths, image_objects, device, dtype
+            return torch.from_numpy(
+                np.stack([frame["extrinsics"] for frame in frame_entries], axis=0)
+            ).to(torch.float64)
+
+        results = evaluate_asl_datasets(
+            args=args,
+            model=None,
+            device="cpu",
+            dtype=torch.float32,
+            predictor=predictor,
+        )
+
+        self.assertEqual(set(results.keys()), {"euroc", "uma_vi"})
+        self.assertEqual(results["euroc"]["clean"]["num_sequences"], 1)
+        self.assertEqual(results["uma_vi"]["clean"]["num_sequences"], 1)
+        self.assertAlmostEqual(results["euroc"]["clean"]["AUC@30"], 1.0)
+        self.assertAlmostEqual(results["uma_vi"]["clean"]["AUC@30"], 1.0)
+
+    def test_evaluate_asl_datasets_skips_empty_sequence_lists(self):
+        args = SimpleNamespace(
+            datasets=[
+                {
+                    "name": "euroc",
+                    "data_root": str(self.euroc_dir),
+                    "annotation_dir": str(self.euroc_anno_dir),
+                    "camera_names": ["cam0"],
+                    "sequence_names": [],
+                },
+                {
+                    "name": "uma_vi",
+                    "data_root": str(self.uma_dir),
+                    "annotation_dir": str(self.uma_anno_dir),
+                    "camera_names": ["cam0"],
+                    "sequence_names": ["corridor_01"],
+                },
+            ],
+            split="test",
+            min_num_images=2,
+            num_frames=3,
+            fast_eval=False,
+            seed=0,
+            no_undistort=True,
+            use_imu=False,
+        )
+
+        def predictor(model, image_paths, image_objects, frame_entries, device, dtype):
+            del model, image_paths, image_objects, device, dtype
+            return torch.from_numpy(
+                np.stack([frame["extrinsics"] for frame in frame_entries], axis=0)
+            ).to(torch.float64)
+
+        results = evaluate_asl_datasets(
+            args=args,
+            model=None,
+            device="cpu",
+            dtype=torch.float32,
+            predictor=predictor,
+        )
+
+        self.assertEqual(list(results.keys()), ["uma_vi"])
 
 
 class TestRealEstate10KCameraPoseEvaluation(unittest.TestCase):

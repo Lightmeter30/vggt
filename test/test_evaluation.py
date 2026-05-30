@@ -22,7 +22,7 @@ from evaluation.datasets.asl.camera_pose import (
     evaluate_asl_datasets,
     load_asl_sequence_entries,
 )
-from evaluation.datasets.euroc.camera_pose import (
+from evaluation.datasets.asl.camera_pose import (
     evaluate_euroc_variants,
     evaluate_sequences,
     load_euroc_image_object,

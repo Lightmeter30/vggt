@@ -1,6 +1,5 @@
 from evaluation.datasets.asl import camera_pose as asl_camera_pose
 from evaluation.datasets.co3d import camera_pose as co3d_camera_pose
-from evaluation.datasets.euroc import camera_pose as euroc_camera_pose
 from evaluation.datasets.realestate10k import camera_pose as realestate10k_camera_pose
 from evaluation.datasets.realx3d import camera_pose as realx3d_camera_pose
 
@@ -8,7 +7,7 @@ from evaluation.datasets.realx3d import camera_pose as realx3d_camera_pose
 TASK_REGISTRY = {
     ("asl", "camera_pose"): asl_camera_pose,
     ("co3d", "camera_pose"): co3d_camera_pose,
-    ("euroc", "camera_pose"): euroc_camera_pose,
+    ("euroc", "camera_pose"): asl_camera_pose,  # euroc 已合并入 asl
     ("realestate10k", "camera_pose"): realestate10k_camera_pose,
     ("realx3d", "camera_pose"): realx3d_camera_pose,
 }

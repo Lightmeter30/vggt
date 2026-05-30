@@ -1,12 +1,434 @@
 import gzip
 import json
+import os
+import random
 from datetime import datetime
 from pathlib import Path
 
-from evaluation.datasets.euroc.camera_pose import (
-    _build_euroc_sequence_entries,
-    evaluate_sequences,
-)
+import cv2
+import numpy as np
+import torch
+
+from evaluation.common.io import load_json_gz
+from evaluation.common.metrics import calculate_auc_np, se3_to_relative_pose_error
+from vggt.utils.load_fn import load_and_preprocess_images_from_objects
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+
+# ---------------------------------------------------------------------------
+# 共享底层函数（原 evaluation/datasets/euroc/camera_pose.py，现统一放在 asl）
+# ---------------------------------------------------------------------------
+
+
+def _deserialize_sensor(sensor):
+    return {
+        "intrinsics": np.asarray(sensor["intrinsics"], dtype=np.float32),
+        "distortion": np.asarray(sensor["distortion"], dtype=np.float32),
+        "undistorted_intrinsics": np.asarray(
+            sensor["undistorted_intrinsics"], dtype=np.float32
+        ),
+        "image_size": np.asarray(sensor["image_size"], dtype=np.int32),
+        "distortion_model": str(sensor.get("distortion_model", "radial-tangential")),
+    }
+
+
+def _deserialize_imu_data(imu_data):
+    if imu_data is None:
+        return None
+    return {
+        "timestamps_ns": np.asarray(imu_data["timestamps_ns"], dtype=np.int64),
+        "gyro": np.asarray(imu_data["gyro"], dtype=np.float32),
+        "accel": np.asarray(imu_data["accel"], dtype=np.float32),
+    }
+
+
+def _deserialize_frame(frame, data_root):
+    return {
+        "timestamp_ns": int(frame["timestamp_ns"]),
+        "gt_timestamp_ns": int(frame["gt_timestamp_ns"]),
+        "pose_dt_ns": int(frame["pose_dt_ns"]),
+        "image_rel_path": frame["image_rel_path"],
+        "image_path": os.path.join(str(data_root), frame["image_rel_path"]),
+        "extrinsics": np.asarray(
+            frame.get("extrinsics", frame.get("extrinsics_w2c")), dtype=np.float64
+        ),
+    }
+
+
+def _build_euroc_sequence_entries(raw_annotation, euroc_dir, camera_names, min_num_images):
+    """构建序列条目列表（兼容旧名，参数名保留 euroc_dir）。"""
+    camera_filter = set(camera_names or [])
+    sequence_entries = []
+
+    for seq_name, payload in sorted(raw_annotation.items()):
+        if camera_filter and payload["camera_name"] not in camera_filter:
+            continue
+
+        frames = [_deserialize_frame(frame, euroc_dir) for frame in payload["frames"]]
+        if len(frames) < min_num_images:
+            continue
+
+        sequence_entries.append(
+            {
+                "seq_name": seq_name,
+                "camera_name": payload["camera_name"],
+                "sensor": _deserialize_sensor(payload["sensor"]),
+                "imu_data": _deserialize_imu_data(payload.get("imu_data")),
+                "frames": frames,
+            }
+        )
+
+    return sequence_entries
+
+
+def load_euroc_sequence_entries(annotation_path, euroc_dir, camera_names, min_num_images):
+    """从单个 jgz 文件加载序列条目（兼容旧名）。"""
+    raw_annotation = load_json_gz(annotation_path)
+    return _build_euroc_sequence_entries(
+        raw_annotation=raw_annotation,
+        euroc_dir=euroc_dir,
+        camera_names=camera_names,
+        min_num_images=min_num_images,
+    )
+
+
+def load_euroc_image_object(image_path, sensor, undistort_images):
+    """加载并可选去畸变的图像（兼容旧名）。"""
+    image_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        raise FileNotFoundError(f"Failed to read image: {image_path}")
+
+    if undistort_images:
+        if sensor.get("distortion_model") == "equidistant":
+            image_bgr = cv2.fisheye.undistortImage(
+                image_bgr,
+                sensor["intrinsics"],
+                sensor["distortion"].reshape(-1, 1),
+                Knew=sensor["undistorted_intrinsics"],
+            )
+        else:
+            image_bgr = cv2.undistort(
+                image_bgr,
+                sensor["intrinsics"],
+                sensor["distortion"],
+                None,
+                sensor["undistorted_intrinsics"],
+            )
+
+    return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+
+def _empty_imu_window(imu_num_samples):
+    return (
+        np.zeros((imu_num_samples, 6), dtype=np.float32),
+        np.zeros((imu_num_samples,), dtype=bool),
+    )
+
+
+def _format_imu_features(gyro, accel, imu_feature_order):
+    if imu_feature_order == "gyro_accel":
+        return np.concatenate([gyro, accel], axis=-1).astype(np.float32)
+    if imu_feature_order == "accel_gyro":
+        return np.concatenate([accel, gyro], axis=-1).astype(np.float32)
+    raise ValueError(f"Unsupported imu_feature_order: {imu_feature_order}")
+
+
+def build_imu_window(
+    imu_data,
+    center_timestamp_ns,
+    imu_window_ns=100_000_000,
+    imu_num_samples=32,
+    imu_feature_order="gyro_accel",
+):
+    if imu_num_samples <= 0:
+        raise ValueError(f"imu_num_samples must be positive, got {imu_num_samples}")
+    if imu_data is None:
+        return _empty_imu_window(imu_num_samples)
+
+    timestamps = imu_data["timestamps_ns"]
+    if len(timestamps) == 0:
+        return _empty_imu_window(imu_num_samples)
+
+    start_ts = int(center_timestamp_ns) - int(imu_window_ns)
+    end_ts = int(center_timestamp_ns) + int(imu_window_ns)
+    left = int(np.searchsorted(timestamps, start_ts, side="left"))
+    right = int(np.searchsorted(timestamps, end_ts, side="right"))
+    window_timestamps = timestamps[left:right]
+    if len(window_timestamps) == 0:
+        return _empty_imu_window(imu_num_samples)
+
+    target_timestamps = np.linspace(
+        start_ts,
+        end_ts,
+        num=imu_num_samples,
+        dtype=np.float64,
+    )
+    gyro = np.zeros((imu_num_samples, 3), dtype=np.float32)
+    accel = np.zeros((imu_num_samples, 3), dtype=np.float32)
+    valid_mask = (
+        (target_timestamps >= float(window_timestamps[0]))
+        & (target_timestamps <= float(window_timestamps[-1]))
+    )
+
+    window_ts_f64 = window_timestamps.astype(np.float64)
+    imu_gyro = imu_data["gyro"][left:right]
+    imu_accel = imu_data["accel"][left:right]
+    for axis in range(3):
+        gyro[:, axis] = np.interp(
+            target_timestamps,
+            window_ts_f64,
+            imu_gyro[:, axis].astype(np.float64),
+        ).astype(np.float32)
+        accel[:, axis] = np.interp(
+            target_timestamps,
+            window_ts_f64,
+            imu_accel[:, axis].astype(np.float64),
+        ).astype(np.float32)
+
+    imu_window = _format_imu_features(gyro, accel, imu_feature_order)
+    imu_window[~valid_mask] = 0.0
+    return imu_window, valid_mask.astype(bool)
+
+
+def attach_imu_windows_to_frames(
+    frame_entries,
+    imu_data,
+    imu_window_ns=100_000_000,
+    imu_num_samples=32,
+    imu_feature_order="gyro_accel",
+):
+    updated_entries = []
+    for frame in frame_entries:
+        frame = dict(frame)
+        imu_window, imu_window_mask = build_imu_window(
+            imu_data=imu_data,
+            center_timestamp_ns=frame["timestamp_ns"],
+            imu_window_ns=imu_window_ns,
+            imu_num_samples=imu_num_samples,
+            imu_feature_order=imu_feature_order,
+        )
+        frame["imu_window"] = imu_window
+        frame["imu_window_mask"] = imu_window_mask
+        updated_entries.append(frame)
+    return updated_entries
+
+
+def predict_camera_extrinsics(
+    model,
+    image_paths,
+    image_objects,
+    frame_entries,
+    device,
+    dtype,
+):
+    del image_paths
+    images = load_and_preprocess_images_from_objects(image_objects).to(device)
+    model_kwargs = {"images": images}
+    if frame_entries and "imu_window" in frame_entries[0]:
+        model_kwargs["imu_windows"] = torch.from_numpy(
+            np.stack([frame["imu_window"] for frame in frame_entries], axis=0)
+        ).to(device=device, dtype=images.dtype)
+        model_kwargs["imu_window_masks"] = torch.from_numpy(
+            np.stack([frame["imu_window_mask"] for frame in frame_entries], axis=0)
+        ).to(device=device)
+
+    with torch.no_grad():
+        if device.type == "cuda":
+            with torch.cuda.amp.autocast(dtype=dtype):
+                predictions = model(**model_kwargs)
+        else:
+            predictions = model(**model_kwargs)
+
+    pose_encoding = predictions["pose_enc"].to(torch.float64)
+    extrinsic, _ = pose_encoding_to_extri_intri(pose_encoding, images.shape[-2:])
+    return extrinsic[0].to(torch.float64)
+
+
+def evaluate_sequence(
+    model,
+    sequence_entry,
+    sampled_indices,
+    device,
+    dtype,
+    undistort_images,
+    predictor=None,
+    use_imu=False,
+    imu_window_ns=100_000_000,
+    imu_num_samples=32,
+    imu_feature_order="gyro_accel",
+):
+    frame_entries = [sequence_entry["frames"][index] for index in sampled_indices]
+    if use_imu:
+        frame_entries = attach_imu_windows_to_frames(
+            frame_entries=frame_entries,
+            imu_data=sequence_entry.get("imu_data"),
+            imu_window_ns=imu_window_ns,
+            imu_num_samples=imu_num_samples,
+            imu_feature_order=imu_feature_order,
+        )
+    image_paths = [frame["image_path"] for frame in frame_entries]
+    image_objects = [
+        load_euroc_image_object(path, sequence_entry["sensor"], undistort_images)
+        for path in image_paths
+    ]
+
+    predictor = predictor or predict_camera_extrinsics
+    pred_extrinsic = predictor(
+        model=model,
+        image_paths=image_paths,
+        image_objects=image_objects,
+        frame_entries=frame_entries,
+        device=device,
+        dtype=dtype,
+    ).to(device=device, dtype=torch.float64)
+
+    gt_extrinsic = torch.tensor(
+        np.stack([frame["extrinsics"] for frame in frame_entries], axis=0),
+        device=device,
+        dtype=torch.float64,
+    )
+    add_row = torch.tensor([0.0, 0.0, 0.0, 1.0], device=device, dtype=torch.float64).expand(
+        pred_extrinsic.size(0), 1, 4
+    )
+
+    pred_se3 = torch.cat((pred_extrinsic, add_row), dim=1)
+    gt_se3 = torch.cat((gt_extrinsic, add_row), dim=1)
+    rel_rangle_deg, rel_tangle_deg = se3_to_relative_pose_error(
+        pred_se3, gt_se3, len(frame_entries)
+    )
+
+    return {
+        "seq_name": sequence_entry["seq_name"],
+        "frame_indices": sampled_indices.tolist(),
+        "rError": rel_rangle_deg.cpu().numpy(),
+        "tError": rel_tangle_deg.cpu().numpy(),
+        "R_ACC@5": (rel_rangle_deg < 5).double().mean().item(),
+        "T_ACC@5": (rel_tangle_deg < 5).double().mean().item(),
+    }
+
+
+def evaluate_sequences(
+    model,
+    sequence_entries,
+    num_frames,
+    fast_eval,
+    seed,
+    device,
+    dtype,
+    undistort_images,
+    predictor=None,
+    use_imu=False,
+    imu_window_ns=100_000_000,
+    imu_num_samples=32,
+    imu_feature_order="gyro_accel",
+):
+    python_rng = random.Random(seed)
+    numpy_rng = np.random.default_rng(seed)
+    selected_entries = list(sequence_entries)
+
+    if fast_eval and len(selected_entries) > 10:
+        selected_entries = python_rng.sample(selected_entries, 10)
+        selected_entries = sorted(selected_entries, key=lambda item: item["seq_name"])
+
+    per_sequence = []
+    r_errors = []
+    t_errors = []
+
+    for sequence_entry in selected_entries:
+        if len(sequence_entry["frames"]) < num_frames:
+            continue
+
+        sampled_indices = np.sort(
+            numpy_rng.choice(len(sequence_entry["frames"]), size=num_frames, replace=False)
+        )
+        sequence_result = evaluate_sequence(
+            model=model,
+            sequence_entry=sequence_entry,
+            sampled_indices=sampled_indices,
+            device=device,
+            dtype=dtype,
+            undistort_images=undistort_images,
+            predictor=predictor,
+            use_imu=use_imu,
+            imu_window_ns=imu_window_ns,
+            imu_num_samples=imu_num_samples,
+            imu_feature_order=imu_feature_order,
+        )
+        per_sequence.append(sequence_result)
+        r_errors.extend(sequence_result["rError"])
+        t_errors.extend(sequence_result["tError"])
+
+    if not r_errors:
+        return {
+            "num_sequences": 0,
+            "per_sequence": per_sequence,
+            "AUC@30": 0.0,
+            "AUC@15": 0.0,
+            "AUC@5": 0.0,
+            "AUC@3": 0.0,
+        }
+
+    r_errors = np.asarray(r_errors)
+    t_errors = np.asarray(t_errors)
+    auc_30, _ = calculate_auc_np(r_errors, t_errors, max_threshold=30)
+    auc_15, _ = calculate_auc_np(r_errors, t_errors, max_threshold=15)
+    auc_5, _ = calculate_auc_np(r_errors, t_errors, max_threshold=5)
+    auc_3, _ = calculate_auc_np(r_errors, t_errors, max_threshold=3)
+
+    return {
+        "num_sequences": len(per_sequence),
+        "per_sequence": per_sequence,
+        "AUC@30": auc_30,
+        "AUC@15": auc_15,
+        "AUC@5": auc_5,
+        "AUC@3": auc_3,
+    }
+
+
+def _evaluate_sequence_entries(args, model, device, dtype, sequence_entries, predictor=None):
+    return evaluate_sequences(
+        model=model,
+        sequence_entries=sequence_entries,
+        num_frames=args.num_frames,
+        fast_eval=args.fast_eval,
+        seed=args.seed,
+        device=device,
+        dtype=dtype,
+        undistort_images=not args.no_undistort,
+        predictor=predictor,
+        use_imu=getattr(args, "use_imu", False),
+        imu_window_ns=getattr(args, "imu_window_ns", 100_000_000),
+        imu_num_samples=getattr(args, "imu_num_samples", 32),
+        imu_feature_order=getattr(args, "imu_feature_order", "gyro_accel"),
+    )
+
+
+def evaluate_euroc_variants(args, model, device, dtype, predictor=None):
+    """兼容旧评测入口：从 euroc_{split}.jgz 加载标注并评测。"""
+    annotation_path = os.path.join(args.euroc_anno_dir, f"euroc_{args.split}.jgz")
+    raw_annotation = load_json_gz(annotation_path)
+
+    clean_entries = _build_euroc_sequence_entries(
+        raw_annotation=raw_annotation,
+        euroc_dir=args.euroc_dir,
+        camera_names=tuple(args.camera_names),
+        min_num_images=args.min_num_images,
+    )
+    return {
+        "clean": _evaluate_sequence_entries(
+            args=args,
+            model=model,
+            device=device,
+            dtype=dtype,
+            sequence_entries=clean_entries,
+            predictor=predictor,
+        )
+    }
+
+
+# ---------------------------------------------------------------------------
+# ASL 评测入口
+# ---------------------------------------------------------------------------
 
 
 def add_arguments(parser):

@@ -44,7 +44,7 @@ cd training && conda run -n my_vggt_relocation torchrun --nproc_per_node=4 launc
 
 - Co3D annotation：`data/preprocess/generate_local_co3d_annotations.py`
 - RealEstate10K 抽帧与 manifest：`data/preprocess/generate_local_realestate10k_frames.py`
-- ASL/MAV VI annotation：`data/preprocess/generate_euroc_annotations.py`，默认写出 per-sequence `*.jgz` 和 `sequence_manifest.json`。
+- ASL/MAV VI annotation：`data/preprocess/generate_asl_annotations.py`，默认写出 per-sequence `*.jgz` 和 `sequence_manifest.json`。
 - TUM/UMA 转 ASL：`data/preprocess/convert_tum_rectified_to_asl.py`、`data/preprocess/convert_uma_vi_to_asl.py`。
 - ASL Dataset：`data/datasets/asl.py`，用于 EuRoC / TUM-VI / KAIST-VI / UMA-VI 的 ASL/MAV 格式数据。
 - Co3D Dataset：`data/datasets/co3d.py`

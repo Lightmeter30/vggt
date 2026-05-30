@@ -16,7 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from training.data.preprocess import generate_euroc_annotations as gen_euroc
+from training.data.preprocess import generate_asl_annotations as gen_euroc
 from training.data.preprocess import inspect_vi_dataset
 
 
@@ -113,7 +113,7 @@ class TestGenerateEurocAnnotations(unittest.TestCase):
             _write_asl_sequence(euroc_dir, "vicon_room2/V2_02_medium")
 
             argv = [
-                "generate_euroc_annotations.py",
+                "generate_asl_annotations.py",
                 "--asl_dir",
                 str(euroc_dir),
                 "--output_dir",
@@ -200,7 +200,7 @@ class TestGenerateEurocAnnotations(unittest.TestCase):
                 yaml.safe_dump(sensor, f, sort_keys=False)
 
             argv = [
-                "generate_euroc_annotations.py",
+                "generate_asl_annotations.py",
                 "--asl_dir",
                 str(uma_dir),
                 "--output_dir",

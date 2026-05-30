@@ -26,8 +26,6 @@ class ASLDataset(BaseDataset):
         dataset_name: str = "euroc",
         ASL_DIR: str = None,
         ASL_ANNOTATION_DIR: str = None,
-        EUROC_DIR: str = None,
-        EUROC_ANNOTATION_DIR: str = None,
         annotation_prefix: str = None,
         annotation_mode: str = "per_sequence",
         sequence_names: Optional[Sequence[str]] = None,
@@ -61,10 +59,6 @@ class ASLDataset(BaseDataset):
         self.inside_random = common_conf.inside_random
         self.allow_duplicate_img = common_conf.allow_duplicate_img
 
-        if ASL_DIR is None:
-            ASL_DIR = EUROC_DIR
-        if ASL_ANNOTATION_DIR is None:
-            ASL_ANNOTATION_DIR = EUROC_ANNOTATION_DIR
         if ASL_DIR is None or ASL_ANNOTATION_DIR is None:
             raise ValueError("Both ASL_DIR and ASL_ANNOTATION_DIR must be specified.")
 
@@ -75,8 +69,6 @@ class ASLDataset(BaseDataset):
         self.sequence_names = None if sequence_names is None else tuple(sequence_names)
         self.ASL_DIR = osp.abspath(ASL_DIR)
         self.ASL_ANNOTATION_DIR = osp.abspath(ASL_ANNOTATION_DIR)
-        self.EUROC_DIR = self.ASL_DIR
-        self.EUROC_ANNOTATION_DIR = self.ASL_ANNOTATION_DIR
         self.min_num_images = min_num_images
         self.expand_ratio = expand_ratio
         self.camera_names = tuple(camera_names)
@@ -205,7 +197,7 @@ class ASLDataset(BaseDataset):
         if not osp.isfile(annotation_file):
             raise FileNotFoundError(
                 f"ASL annotation file not found: {annotation_file}. "
-                "Run training/data/preprocess/generate_euroc_annotations.py first."
+                "Run training/data/preprocess/generate_asl_annotations.py first."
             )
 
         with gzip.open(annotation_file, "rt", encoding="utf-8") as fin:

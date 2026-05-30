@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Dict, Sequence
 
 try:
-    from training.data.preprocess.generate_euroc_annotations import (
+    from training.data.preprocess.generate_asl_annotations import (
         discover_sequences,
         find_nearest_timestamp,
         load_camera_sensor,
@@ -21,7 +21,7 @@ try:
         short_sequence_name,
     )
 except ImportError:
-    from generate_euroc_annotations import (
+    from generate_asl_annotations import (
         discover_sequences,
         find_nearest_timestamp,
         load_camera_sensor,

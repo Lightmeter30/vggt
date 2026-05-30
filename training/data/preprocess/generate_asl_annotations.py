@@ -1,11 +1,10 @@
 import argparse
 import csv
-from copy import deepcopy
 import gzip
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -13,31 +12,21 @@ import yaml
 
 try:
     from training.data.preprocess.vi_schema import (
-        EUROC_SPLIT_SEQUENCES,
         SCHEMA_VERSION,
-        SPLIT_NAMES,
         attach_sequence_metadata,
         build_sequence_manifest,
-        build_split_manifest,
         ensure_frame_extrinsics_aliases,
-        normalize_split_sequences,
         sequence_entry_key,
-        sequence_to_split_roles,
         short_sequence_name,
         validate_vi_annotation,
     )
 except ImportError:
     from vi_schema import (
-        EUROC_SPLIT_SEQUENCES,
         SCHEMA_VERSION,
-        SPLIT_NAMES,
         attach_sequence_metadata,
         build_sequence_manifest,
-        build_split_manifest,
         ensure_frame_extrinsics_aliases,
-        normalize_split_sequences,
         sequence_entry_key,
-        sequence_to_split_roles,
         short_sequence_name,
         validate_vi_annotation,
     )
@@ -387,121 +376,6 @@ def build_asl_annotations(
     return outputs, stats
 
 
-def build_split_annotations(
-    euroc_dir: Path,
-    sequence_dirs: Sequence[Path],
-    camera_names: Sequence[str],
-    max_pose_time_diff_ns: int,
-    split_sequences: Optional[Mapping[str, Sequence[str]]] = None,
-) -> Tuple[Dict[str, Dict], Dict[str, int]]:
-    outputs: Dict[str, Dict] = {}
-    stats = {
-        "sequences": 0,
-        "camera_entries": 0,
-        "matched_frames": 0,
-        "missing_images": 0,
-        "pose_gap_skipped": 0,
-    }
-
-    split_sequences = normalize_split_sequences(split_sequences)
-    split_roles_by_sequence = sequence_to_split_roles(split_sequences)
-    for sequence_dir in sequence_dirs:
-        sequence_path = sequence_dir.relative_to(euroc_dir).as_posix()
-        sequence_name = short_sequence_name(sequence_path)
-        split_roles = split_roles_by_sequence.get(sequence_name, [])
-        if not split_roles:
-            raise ValueError(
-                f"No EuRoC split configured for sequence {sequence_name} ({sequence_path})"
-            )
-        split = split_roles[0]
-
-        gt_timestamps, world_from_body = load_groundtruth(
-            sequence_dir / "mav0" / "state_groundtruth_estimate0" / "data.csv"
-        )
-        imu_csv = sequence_dir / "mav0" / "imu0" / "data.csv"
-        imu_data = load_imu_data(imu_csv) if imu_csv.is_file() else None
-
-        stats["sequences"] += 1
-        for camera_name in camera_names:
-            sequence_name, payload, camera_stats = build_camera_annotation(
-                asl_dir=euroc_dir,
-                dataset_name="euroc",
-                sequence_dir=sequence_dir,
-                camera_name=camera_name,
-                gt_timestamps=gt_timestamps,
-                world_from_body=world_from_body,
-                imu_data=imu_data,
-                max_pose_time_diff_ns=max_pose_time_diff_ns,
-                split=split,
-            )
-            stats["matched_frames"] += camera_stats["matched_frames"]
-            stats["missing_images"] += camera_stats["missing_images"]
-            stats["pose_gap_skipped"] += camera_stats["pose_gap_skipped"]
-
-            if sequence_name is None or payload is None:
-                continue
-
-            payload["split_roles"] = list(split_roles)
-            outputs[sequence_name] = payload
-            stats["camera_entries"] += 1
-
-    return outputs, stats
-
-
-def group_annotations_by_split(annotation: Dict[str, Dict]) -> Dict[str, Dict[str, Dict]]:
-    grouped: Dict[str, Dict[str, Dict]] = {split: {} for split in SPLIT_NAMES}
-    for entry_key, payload in sorted(annotation.items()):
-        split_roles = payload.get("split_roles", [payload["split"]])
-        for split in split_roles:
-            split_payload = deepcopy(payload)
-            split_payload["split"] = split
-            grouped[split][entry_key] = split_payload
-    return grouped
-
-
-def collect_manifest_inputs(
-    annotation: Dict[str, Dict],
-) -> Tuple[Dict[str, str], Dict[str, int]]:
-    sequence_paths: Dict[str, str] = {}
-    frame_counts: Dict[str, int] = {}
-    for payload in annotation.values():
-        sequence_name = payload["sequence_name"]
-        sequence_paths[sequence_name] = payload["sequence_path"]
-        frame_counts[sequence_name] = max(
-            frame_counts.get(sequence_name, 0),
-            len(payload["frames"]),
-        )
-    return sequence_paths, frame_counts
-
-
-def write_split_outputs(
-    output_dir: Path,
-    annotation: Dict[str, Dict],
-    camera_names: Sequence[str],
-    max_pose_time_diff_ns: int,
-    split_sequences: Optional[Mapping[str, Sequence[str]]] = None,
-) -> Dict:
-    grouped = group_annotations_by_split(annotation)
-    for split, payload in grouped.items():
-        validate_vi_annotation(payload)
-        dump_jgz(output_dir / f"euroc_{split}.jgz", payload)
-
-    sequence_paths, frame_counts = collect_manifest_inputs(annotation)
-    manifest = build_split_manifest(
-        dataset="euroc",
-        sequence_paths=sequence_paths,
-        frame_counts=frame_counts,
-        camera_names=camera_names,
-        max_pose_time_diff_ns=max_pose_time_diff_ns,
-        split_sequences=split_sequences,
-    )
-    with open(output_dir / "split_manifest.json", "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, ensure_ascii=False)
-    with open(output_dir / "schema_version.json", "w", encoding="utf-8") as f:
-        json.dump({"schema_version": SCHEMA_VERSION}, f, indent=2)
-    return manifest
-
-
 def write_sequence_outputs(
     output_dir: Path,
     annotation: Dict[str, Dict],
@@ -553,16 +427,13 @@ def write_sequence_outputs(
     return manifest
 
 
-def sequence_output_stem(euroc_dir: Path, sequence_dir: Path) -> str:
-    return sequence_dir.relative_to(euroc_dir).as_posix().replace("/", "__")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate local ASL/MAV VI annotations compatible with VGGT training."
     )
-    parser.add_argument("--asl_dir", help="Path to a local ASL/MAV dataset root.")
-    parser.add_argument("--euroc_dir", help="Backward-compatible alias for --asl_dir.")
+    parser.add_argument(
+        "--asl_dir", required=True, help="Path to a local ASL/MAV dataset root."
+    )
     parser.add_argument(
         "--dataset_name",
         default="euroc",
@@ -570,16 +441,6 @@ def main() -> None:
     )
     parser.add_argument(
         "--output_dir", required=True, help="Directory to write generated *.jgz files."
-    )
-    parser.add_argument(
-        "--dataset_format",
-        choices=["asl"],
-        default="asl",
-        help=(
-            "Input dataset layout. 'asl' expects EuRoC MAV/ASL format with "
-            "sequence/mav0/cam*/data.csv, sensor.yaml, and "
-            "state_groundtruth_estimate0/data.csv."
-        ),
     )
     parser.add_argument(
         "--camera_names",
@@ -593,20 +454,9 @@ def main() -> None:
         default=10_000_000,
         help="Maximum allowed image/GT timestamp mismatch in nanoseconds.",
     )
-    parser.add_argument(
-        "--output_mode",
-        choices=["split", "per_sequence"],
-        default="per_sequence",
-        help=(
-            "Write one file per sequence, or legacy euroc_train/val/test.jgz files."
-        ),
-    )
     args = parser.parse_args()
 
-    asl_arg = args.asl_dir or args.euroc_dir
-    if not asl_arg:
-        parser.error("one of --asl_dir or --euroc_dir is required")
-    asl_dir = Path(asl_arg).resolve()
+    asl_dir = Path(args.asl_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -620,50 +470,6 @@ def main() -> None:
         max_pose_time_diff_ns=args.max_pose_time_diff_ns,
     )
 
-    if args.output_mode == "split":
-        if args.dataset_name != "euroc":
-            raise ValueError("--output_mode split is only supported for dataset_name=euroc")
-        for payload in annotation.values():
-            sequence_name = payload["sequence_name"]
-            split_roles = sequence_to_split_roles(
-                normalize_split_sequences(EUROC_SPLIT_SEQUENCES)
-            ).get(sequence_name, [])
-            if not split_roles:
-                raise ValueError(f"No EuRoC split configured for sequence {sequence_name}")
-            payload["split"] = split_roles[0]
-            payload["split_roles"] = list(split_roles)
-        manifest = write_split_outputs(
-            output_dir=output_dir,
-            annotation=annotation,
-            camera_names=args.camera_names,
-            max_pose_time_diff_ns=args.max_pose_time_diff_ns,
-            split_sequences=EUROC_SPLIT_SEQUENCES,
-        )
-        summary = {
-            "dataset_format": args.dataset_format,
-            "output_mode": args.output_mode,
-            "schema_version": SCHEMA_VERSION,
-            "camera_names": list(args.camera_names),
-            "max_pose_time_diff_ns": args.max_pose_time_diff_ns,
-            "sequence_dirs": [p.relative_to(asl_dir).as_posix() for p in sequence_dirs],
-            "generated_files": [f"euroc_{split}.jgz" for split in SPLIT_NAMES],
-            "total": total_stats,
-            "split_manifest": manifest,
-        }
-        with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2, ensure_ascii=False)
-
-        print(f"Generated annotations under: {output_dir}")
-        print(f"Discovered sequences: {len(sequence_dirs)}")
-        print("Generated split files: euroc_train.jgz, euroc_val.jgz, euroc_test.jgz")
-        for split in SPLIT_NAMES:
-            split_counts = manifest["counts"][split]
-            print(
-                f"{split}: sequences={split_counts['sequence_count']} "
-                f"frames={split_counts['frame_count']}"
-            )
-        return
-
     manifest = write_sequence_outputs(
         output_dir=output_dir,
         annotation=annotation,
@@ -673,8 +479,6 @@ def main() -> None:
     )
 
     summary = {
-        "dataset_format": args.dataset_format,
-        "output_mode": args.output_mode,
         "dataset_name": args.dataset_name,
         "schema_version": SCHEMA_VERSION,
         "camera_names": list(args.camera_names),

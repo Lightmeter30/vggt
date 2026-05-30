@@ -21,7 +21,7 @@ if str(TRAINING_ROOT) not in sys.path:
 
 from data.datasets.asl import ASLDataset
 from data.composed_dataset import ComposedDataset
-from training.data.preprocess import generate_euroc_annotations as gen_euroc
+from training.data.preprocess import generate_asl_annotations as gen_euroc
 
 
 def _make_common_conf():

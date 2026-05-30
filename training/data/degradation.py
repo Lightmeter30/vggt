@@ -13,9 +13,6 @@ DEGRADATION_LABEL_TO_ID = {
     "exposure": 2,
     "mixed": 3,
 }
-DEGRADATION_ID_TO_LABEL = {
-    value: key for key, value in DEGRADATION_LABEL_TO_ID.items()
-}
 
 DEFAULT_TRAINING_DEGRADATION_WEIGHTS = {
     "clean": 0.25,
@@ -241,7 +238,8 @@ def apply_degradation(image: np.ndarray, config: Mapping) -> Tuple[np.ndarray, D
         )
     elif degradation_type == "mixed":
         order = params.get("order", ["motion_blur", "exposure"])
-        output = np.array(image, copy=True)
+        # 各子步骤（motion_blur / exposure）均返回新数组，无需提前拷贝
+        output = image
         for step in order:
             if step == "motion_blur":
                 motion_params = params["motion_blur"]

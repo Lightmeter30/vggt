@@ -87,7 +87,7 @@ def compute_camera_loss(
     weight_trans=1.0,       # weight for translation loss
     weight_rot=1.0,         # weight for rotation loss
     weight_focal=0.5,       # weight for focal length loss
-    use_point_mask=True,
+    use_point_mask=False,
     valid_point_threshold=100,
     **kwargs
 ):

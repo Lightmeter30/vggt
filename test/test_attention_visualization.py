@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -6,6 +7,7 @@ import torch.nn as nn
 from PIL import Image
 
 from vggt.layers.attention import Attention
+from vggt.models.aggregator import Aggregator
 from vggt.models.vggt import VGGT
 from vggt.utils.attention_visualization import (
     AttentionCaptureConfig,
@@ -93,28 +95,85 @@ def test_attention_capture_writes_overlay_pngs_and_manifest(tmp_path):
     assert "frame_000_camera" in manifest_path.read_text(encoding="utf-8")
 
 
+def test_aggregator_uses_attention_context_provider_hook():
+    aggregator = Aggregator(
+        img_size=14,
+        patch_size=14,
+        embed_dim=8,
+        depth=1,
+        num_heads=2,
+        mlp_ratio=1.0,
+        num_register_tokens=0,
+        patch_embed="conv",
+        aa_order=["frame", "global"],
+        qk_norm=False,
+        rope_freq=-1,
+    )
+    aggregator.eval()
+    calls = []
+
+    def context_provider(**metadata):
+        calls.append(metadata)
+        return None
+
+    images = torch.randn(1, 2, 3, 14, 14)
+    with torch.no_grad():
+        aggregated_tokens, patch_start_idx = aggregator(
+            images,
+            attention_context_provider=context_provider,
+        )
+
+    assert len(aggregated_tokens) == 1
+    assert patch_start_idx == 1
+    assert calls[0]["attention_type"] == "global"
+    assert calls[0]["sequence_length"] == 2
+
+
 class TinyAggregator(nn.Module):
     def __init__(self, img_size=14, patch_size=14, embed_dim=8, **kwargs):
         super().__init__()
         self.embed_dim = embed_dim
-        self.received_attention_capture = "unset"
+        self.received_attention_context_provider = "unset"
+        self.patch_start_idx = 0
 
-    def forward(self, images, motion_tokens=None, imu_fusion=None, attention_capture=None):
-        del motion_tokens, imu_fusion
-        self.received_attention_capture = attention_capture
+    def prepare_tokens(self, images):
         batch_size, sequence_length = images.shape[:2]
+        tokens = torch.zeros(
+            batch_size * sequence_length,
+            1,
+            self.embed_dim,
+            dtype=images.dtype,
+            device=images.device,
+        )
+        return SimpleNamespace(
+            tokens=tokens,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            patch_token_count=1,
+        )
+
+    def aggregate_tokens(self, token_state, attention_context_provider=None):
+        self.received_attention_context_provider = attention_context_provider
+        batch_size = token_state.batch_size
+        sequence_length = token_state.sequence_length
         tokens = torch.zeros(
             batch_size,
             sequence_length,
             1,
             self.embed_dim * 2,
-            dtype=images.dtype,
-            device=images.device,
+            dtype=token_state.tokens.dtype,
+            device=token_state.tokens.device,
         )
         return [tokens], 0
 
+    def forward(self, images, attention_context_provider=None):
+        return self.aggregate_tokens(
+            self.prepare_tokens(images),
+            attention_context_provider=attention_context_provider,
+        )
 
-def test_vggt_forward_passes_attention_capture_to_aggregator():
+
+def test_vggt_forward_passes_attention_context_provider_to_aggregator():
     with patch("vggt.models.vggt.Aggregator", TinyAggregator):
         model = VGGT(
             img_size=14,
@@ -128,8 +187,10 @@ def test_vggt_forward_passes_attention_capture_to_aggregator():
 
     images = torch.randn(1, 2, 3, 14, 14)
     assert model(images) == {}
-    assert model.aggregator.received_attention_capture is None
+    assert model.aggregator.received_attention_context_provider is None
 
-    attention_capture = object()
+    attention_capture = AttentionCaptureSession(
+        AttentionCaptureConfig(output_dir=Path("/tmp/unused_attention_test"))
+    )
     assert model(images, attention_capture=attention_capture) == {}
-    assert model.aggregator.received_attention_capture is attention_capture
+    assert callable(model.aggregator.received_attention_context_provider)

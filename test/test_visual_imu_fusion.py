@@ -1,6 +1,6 @@
 import torch
 
-from vggt.models.visual_imu_fusion import VisualIMUFiLM
+from vggt.layers.visual_imu_fusion import VisualIMUFiLM
 
 
 def test_visual_imu_film_is_identity_at_initialization():
@@ -49,4 +49,3 @@ def test_visual_imu_film_preserves_special_tokens_when_active():
 
     assert torch.allclose(fused[:, :patch_start_idx], tokens[:, :patch_start_idx])
     assert not torch.allclose(fused[:, patch_start_idx:], tokens[:, patch_start_idx:])
-

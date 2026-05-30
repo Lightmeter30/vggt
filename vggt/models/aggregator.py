@@ -9,7 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from typing import Optional, Tuple, Union, List, Dict, Any
+from dataclasses import dataclass
+from typing import Callable, Optional, Tuple, List, Any
 
 from vggt.layers import PatchEmbed
 from vggt.layers.block import Block
@@ -20,6 +21,18 @@ logger = logging.getLogger(__name__)
 
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
+
+
+@dataclass
+class AggregatorTokenState:
+    tokens: torch.Tensor
+    pos: Optional[torch.Tensor]
+    batch_size: int
+    sequence_length: int
+    token_count: int
+    embed_dim: int
+    patch_token_count: int
+    patch_grid: Tuple[int, int]
 
 
 class Aggregator(nn.Module):
@@ -184,21 +197,27 @@ class Aggregator(nn.Module):
     def forward(
         self,
         images: torch.Tensor,
-        motion_tokens: Optional[torch.Tensor] = None,
-        imu_fusion: Optional[nn.Module] = None,
-        attention_capture: Optional[Any] = None,
+        attention_context_provider: Optional[Callable[..., Any]] = None,
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
-            attention_capture: Optional capture session used to record selected global attention maps.
+            attention_context_provider: 可选诊断钩子，用 attention block
+                元信息创建 attention capture context。
 
         Returns:
             (list[torch.Tensor], int):
                 The list of outputs from the attention blocks,
                 and the patch_start_idx indicating where patch tokens begin.
         """
+        token_state = self.prepare_tokens(images)
+        return self.aggregate_tokens(
+            token_state,
+            attention_context_provider=attention_context_provider,
+        )
+
+    def prepare_tokens(self, images: torch.Tensor) -> AggregatorTokenState:
         B, S, C_in, H, W = images.shape
 
         if C_in != 3:
@@ -222,22 +241,13 @@ class Aggregator(nn.Module):
 
         # Concatenate special tokens with patch tokens
         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
-        if imu_fusion is not None and motion_tokens is not None:
-            tokens = imu_fusion(
-                tokens=tokens,
-                motion_tokens=motion_tokens,
-                patch_start_idx=self.patch_start_idx,
-                batch_size=B,
-                sequence_length=S,
-                patch_token_count=P,
-            )
 
         pos = None
         if self.rope is not None:
             pos = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device=images.device)
         patch_grid = (H // self.patch_size, W // self.patch_size)
 
-        if self.patch_start_idx > 0:
+        if self.patch_start_idx > 0 and pos is not None:
             # do not use position embedding for special tokens (camera and register tokens)
             # so set pos to 0 for the special tokens
             pos = pos + 1
@@ -246,6 +256,30 @@ class Aggregator(nn.Module):
 
         # update P because we added special tokens
         _, P, C = tokens.shape
+
+        return AggregatorTokenState(
+            tokens=tokens,
+            pos=pos,
+            batch_size=B,
+            sequence_length=S,
+            token_count=P,
+            embed_dim=C,
+            patch_token_count=P - self.patch_start_idx,
+            patch_grid=patch_grid,
+        )
+
+    def aggregate_tokens(
+        self,
+        token_state: AggregatorTokenState,
+        attention_context_provider: Optional[Callable[..., Any]] = None,
+    ) -> Tuple[List[torch.Tensor], int]:
+        tokens = token_state.tokens
+        pos = token_state.pos
+        B = token_state.batch_size
+        S = token_state.sequence_length
+        P = token_state.token_count
+        C = token_state.embed_dim
+        patch_grid = token_state.patch_grid
 
         frame_idx = 0
         global_idx = 0
@@ -266,7 +300,7 @@ class Aggregator(nn.Module):
                         C,
                         global_idx,
                         pos=pos,
-                        attention_capture=attention_capture,
+                        attention_context_provider=attention_context_provider,
                         patch_grid=patch_grid,
                     )
                 else:
@@ -315,7 +349,7 @@ class Aggregator(nn.Module):
         C,
         global_idx,
         pos=None,
-        attention_capture=None,
+        attention_context_provider=None,
         patch_grid=None,
     ):
         """
@@ -335,8 +369,8 @@ class Aggregator(nn.Module):
                 tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
                 attn_context = None
-                if attention_capture is not None and patch_grid is not None:
-                    attn_context = attention_capture.make_context(
+                if attention_context_provider is not None and patch_grid is not None:
+                    attn_context = attention_context_provider(
                         block_index=global_idx,
                         attention_type="global",
                         batch_size=B,

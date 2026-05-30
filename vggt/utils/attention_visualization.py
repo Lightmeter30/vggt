@@ -90,6 +90,9 @@ class AttentionCaptureSession:
             token_count=int(token_count),
         )
 
+    def context_provider(self, **metadata) -> AttentionCaptureContext:
+        return self.make_context(**metadata)
+
     def capture_attention(self, q: torch.Tensor, k: torch.Tensor, context: AttentionCaptureContext) -> None:
         if context.attention_type != "global":
             return

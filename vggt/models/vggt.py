@@ -13,8 +13,8 @@ from vggt.models.aggregator import Aggregator
 from vggt.heads.camera_head import CameraHead
 from vggt.heads.dpt_head import DPTHead
 from vggt.heads.track_head import TrackHead
-from vggt.models.imu_encoder import IMUEncoder
-from vggt.models.visual_imu_fusion import VisualIMUFiLM
+from vggt.layers.imu_encoder import IMUEncoder
+from vggt.layers.visual_imu_fusion import VisualIMUFiLM
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
@@ -118,13 +118,21 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                     imu_window_masks = imu_window_masks.unsqueeze(0)
                 motion_tokens, motion_risk = self.imu_encoder(imu_windows, imu_window_masks)
 
-        aggregator_kwargs = {
-            "motion_tokens": motion_tokens,
-            "imu_fusion": self.imu_fusion,
-        }
-        if attention_capture is not None:
-            aggregator_kwargs["attention_capture"] = attention_capture
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images, **aggregator_kwargs)
+        token_state = self.aggregator.prepare_tokens(images)
+        if self.imu_fusion is not None and motion_tokens is not None:
+            token_state.tokens = self.imu_fusion(
+                tokens=token_state.tokens,
+                motion_tokens=motion_tokens,
+                patch_start_idx=self.aggregator.patch_start_idx,
+                batch_size=token_state.batch_size,
+                sequence_length=token_state.sequence_length,
+                patch_token_count=token_state.patch_token_count,
+            )
+
+        aggregated_tokens_list, patch_start_idx = self.aggregator.aggregate_tokens(
+            token_state,
+            attention_context_provider=_resolve_attention_context_provider(attention_capture),
+        )
 
         predictions = {}
         if motion_tokens is not None:
@@ -171,3 +179,19 @@ def _config_get(config, key, default=None):
     if isinstance(config, Mapping):
         return config.get(key, default)
     return getattr(config, key, default)
+
+
+def _resolve_attention_context_provider(attention_capture):
+    if attention_capture is None:
+        return None
+    context_provider = getattr(attention_capture, "context_provider", None)
+    if context_provider is not None:
+        return context_provider
+    make_context = getattr(attention_capture, "make_context", None)
+    if make_context is not None:
+        return make_context
+    if callable(attention_capture):
+        return attention_capture
+    raise TypeError(
+        "attention_capture must be callable or provide context_provider/make_context."
+    )

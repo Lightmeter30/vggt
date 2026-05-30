@@ -1,6 +1,6 @@
 import torch
 
-from vggt.models.imu_encoder import IMUEncoder
+from vggt.layers.imu_encoder import IMUEncoder
 
 
 def test_imu_encoder_returns_motion_token_and_risk_with_masks():
@@ -40,4 +40,3 @@ def test_imu_encoder_accepts_missing_mask_as_all_valid():
 
     assert motion_tokens.shape == (1, 2, 12)
     assert motion_risk.shape == (1, 2, 1)
-

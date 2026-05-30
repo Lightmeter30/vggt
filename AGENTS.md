@@ -98,7 +98,7 @@ conda run -n my_vggt_relocation python demo_colmap.py --scene_dir examples/kitch
 - `repomix-output.xml` 只读参考；修改真实源文件。
 - 涉及相机、坐标系、点云导出、评测指标时，先确认数学约定。
 - 修改训练配置时，保留用户需要替换的路径占位项。
-- 修改 IMU 或视觉-惯性融合时，同步检查 `vggt/models/imu_encoder.py`、`vggt/models/visual_imu_fusion.py`、`vggt/models/vggt.py`、`vggt/models/aggregator.py` 和相关测试。
+- 修改 IMU 或视觉-惯性融合时，同步检查 `vggt/layers/imu_encoder.py`、`vggt/layers/visual_imu_fusion.py`、`vggt/models/vggt.py`、`vggt/models/aggregator.py` 和相关测试。
 - 缺依赖时安装到 `my_vggt_relocation`，不要全局安装。
 - 验证受限于网络、权重、GPU、数据集或磁盘输出时，在结果中说明。
 

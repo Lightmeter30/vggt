@@ -12,8 +12,8 @@
 
 - `models/vggt.py`: `VGGT` 定义。
 - `models/aggregator.py`: 共享特征聚合器。
-- `models/imu_encoder.py`: 将每帧 IMU 时间窗编码为 motion token 和 motion risk。
-- `models/visual_imu_fusion.py`: 使用 FiLM 调制视觉 patch tokens。
+- `layers/imu_encoder.py`: 将每帧 IMU 时间窗编码为 motion token 和 motion risk。
+- `layers/visual_imu_fusion.py`: 使用 FiLM 调制视觉 patch tokens。
 - `utils/load_fn.py`: 推理图像预处理统一入口。
 - `utils/pose_enc.py`: 相机编码与转换。
 - `utils/geometry.py`: 几何计算。
@@ -24,7 +24,7 @@
 - `VGGT.forward()` 可选输入 `imu_windows`、`imu_window_masks`、`degradation_metadata`；启用 `imu` 配置时必须提供 `imu_windows`。
 - 输出键名需要兼容 demo、evaluation、training。
 - 启用 IMU 时输出会额外包含 `motion_tokens`、`motion_risk`，训练侧会记录 `motion_risk_mean/std`。
-- `aggregator(images, motion_tokens=None, imu_fusion=None)` 输出 `aggregated_tokens_list, ps_idx`。
+- `aggregator(images)` 输出 `aggregated_tokens_list, ps_idx`；IMU 编码和 FiLM 融合由 `VGGT.forward()` 在 attention 聚合前完成。
 - `Aggregator` 的 FiLM 调制只作用于 patch tokens，不能改变 camera/register special tokens。
 - `VisualIMUFiLM` 最后一层零初始化，初始状态应等价于不调制视觉 token。
 - `camera_head` 输出 `pose_enc`，再转换为 extrinsic `[3x4]`、intrinsic `[3x3]`。
@@ -48,8 +48,8 @@
 ```bash
 conda run -n my_vggt_relocation python -m py_compile vggt/models/vggt.py
 conda run -n my_vggt_relocation python -m py_compile vggt/models/aggregator.py
-conda run -n my_vggt_relocation python -m py_compile vggt/models/imu_encoder.py
-conda run -n my_vggt_relocation python -m py_compile vggt/models/visual_imu_fusion.py
+conda run -n my_vggt_relocation python -m py_compile vggt/layers/imu_encoder.py
+conda run -n my_vggt_relocation python -m py_compile vggt/layers/visual_imu_fusion.py
 conda run -n my_vggt_relocation python -m pytest test/test_imu_encoder.py test/test_visual_imu_fusion.py test/test_vggt_imu_forward.py -q
 conda run -n my_vggt_relocation python -m py_compile vggt/utils/load_fn.py
 conda run -n my_vggt_relocation python -m pytest test/ -q

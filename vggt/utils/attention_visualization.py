@@ -304,10 +304,15 @@ def _build_overlay(image: torch.Tensor, attention_map: torch.Tensor, alpha: floa
 
 
 def _normalize_map(values: torch.Tensor) -> torch.Tensor:
+    if torch.isnan(values).any():
+        return torch.zeros_like(values)
     min_value = values.min()
     max_value = values.max()
     denom = max_value - min_value
-    if float(denom) < 1e-12:
+    # 注意：float32 的 epsilon 约为 1.19e-7，这里用 1e-12 对 float64
+    # 是安全的，但对 float32 输入可能防护不足。使用 abs(denom) 同时
+    # 捕获浮点比较中 NaN 的 IEEE 754 行为（NaN < x 始终为 False）。
+    if abs(float(denom)) < 1e-12:
         return torch.zeros_like(values)
     return (values - min_value) / denom
 

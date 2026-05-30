@@ -169,16 +169,65 @@ def _update_sensor_yaml(
     _write_yaml(sensor_path, sensor)
 
 
-def _update_annotation_payload(payload: dict, new_intrinsics_by_camera: Mapping[str, np.ndarray]) -> bool:
+def _annotation_sequence_candidates(entry_key: str, sequence: Mapping) -> set[str]:
+    candidates = set()
+    for field_name in ("sequence_path", "sequence_name"):
+        value = sequence.get(field_name)
+        if not isinstance(value, str):
+            continue
+        normalized = value.strip("/")
+        if not normalized:
+            continue
+        candidates.add(normalized)
+        candidates.add(normalized.split("/")[-1])
+
+    key_parts = entry_key.strip("/").split("/")
+    if len(key_parts) >= 3:
+        sequence_from_key = "/".join(key_parts[1:-1])
+        if sequence_from_key:
+            candidates.add(sequence_from_key)
+        candidates.add(key_parts[-2])
+    return candidates
+
+
+def _sequence_camera_match(
+    *,
+    entry_key: str,
+    sequence: Mapping,
+    new_intrinsics_by_sequence_camera: Mapping[tuple[str, str], np.ndarray],
+) -> np.ndarray | None:
+    camera_name = sequence.get("camera_name")
+    if not isinstance(camera_name, str) or not camera_name:
+        key_parts = entry_key.strip("/").split("/")
+        camera_name = key_parts[-1] if len(key_parts) >= 3 else None
+    if not camera_name:
+        return None
+
+    for sequence_name in _annotation_sequence_candidates(entry_key, sequence):
+        new_k = new_intrinsics_by_sequence_camera.get((sequence_name, camera_name))
+        if new_k is not None:
+            return new_k
+    return None
+
+
+def _update_annotation_payload(
+    payload: dict,
+    new_intrinsics_by_sequence_camera: Mapping[tuple[str, str], np.ndarray],
+) -> bool:
     changed = False
-    for sequence in payload.values():
-        camera_name = sequence.get("camera_name")
-        if camera_name not in new_intrinsics_by_camera:
+    for entry_key, sequence in payload.items():
+        if not isinstance(sequence, dict):
             continue
         sensor = sequence.get("sensor")
         if not isinstance(sensor, dict):
             continue
-        new_k = new_intrinsics_by_camera[camera_name]
+        new_k = _sequence_camera_match(
+            entry_key=entry_key,
+            sequence=sequence,
+            new_intrinsics_by_sequence_camera=new_intrinsics_by_sequence_camera,
+        )
+        if new_k is None:
+            continue
         sensor["intrinsics"] = new_k.astype(float).tolist()
         sensor["undistorted_intrinsics"] = new_k.astype(float).tolist()
         sensor["distortion"] = list(ZERO_DISTORTION)
@@ -187,25 +236,53 @@ def _update_annotation_payload(payload: dict, new_intrinsics_by_camera: Mapping[
     return changed
 
 
-def _update_manifest_distortion_models(payload: dict, cameras: Iterable[str]) -> bool:
+def _manifest_sequence_candidates(sequence_name: str, record: Mapping) -> set[str]:
+    candidates = {sequence_name}
+    sequence_path = record.get("sequence_path")
+    if isinstance(sequence_path, str):
+        normalized = sequence_path.strip("/")
+        if normalized:
+            candidates.add(normalized)
+            candidates.add(normalized.split("/")[-1])
+    return candidates
+
+
+def _update_manifest_distortion_models(
+    payload: dict,
+    sequence_cameras: Iterable[tuple[str, str]],
+) -> bool:
     changed = False
-    for record in payload.get("sequences", {}).values():
+    sequence_cameras = tuple(sequence_cameras)
+    cameras_by_sequence: dict[str, set[str]] = {}
+    for sequence_name, camera_name in sequence_cameras:
+        cameras_by_sequence.setdefault(sequence_name, set()).add(camera_name)
+
+    for sequence_name, record in payload.get("sequences", {}).items():
+        if not isinstance(record, dict):
+            continue
         distortion_models = record.get("distortion_models")
         if not isinstance(distortion_models, dict):
             continue
-        for camera_name in cameras:
+        cameras_to_update = set()
+        for candidate in _manifest_sequence_candidates(sequence_name, record):
+            cameras_to_update.update(cameras_by_sequence.get(candidate, set()))
+        for camera_name in cameras_to_update:
             if distortion_models.get(camera_name) == "equidistant":
                 distortion_models[camera_name] = "radial-tangential"
                 changed = True
     nested = payload.get("sequence_manifest")
     if isinstance(nested, dict):
-        changed = _update_manifest_distortion_models(nested, cameras) or changed
+        changed = _update_manifest_distortion_models(nested, sequence_cameras) or changed
     return changed
 
 
-def _update_json_manifest(path: Path, cameras: Iterable[str], dry_run: bool) -> bool:
+def _update_json_manifest(
+    path: Path,
+    sequence_cameras: Iterable[tuple[str, str]],
+    dry_run: bool,
+) -> bool:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    changed = _update_manifest_distortion_models(payload, cameras)
+    changed = _update_manifest_distortion_models(payload, sequence_cameras)
     if changed and not dry_run:
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return changed
@@ -214,7 +291,7 @@ def _update_json_manifest(path: Path, cameras: Iterable[str], dry_run: bool) -> 
 def _update_annotations(
     *,
     uma_vi_dir: Path,
-    new_intrinsics_by_camera: Mapping[str, np.ndarray],
+    new_intrinsics_by_sequence_camera: Mapping[tuple[str, str], np.ndarray],
     origin_dir_name: str,
     dry_run: bool,
 ) -> int:
@@ -223,11 +300,11 @@ def _update_annotations(
         return 0
 
     changed_files = 0
-    cameras = tuple(new_intrinsics_by_camera)
+    sequence_cameras = tuple(new_intrinsics_by_sequence_camera)
     for path in sorted(anno_dir.glob("*.jgz")):
         with gzip.open(path, "rt", encoding="utf-8") as f:
             payload = json.load(f)
-        if not _update_annotation_payload(payload, new_intrinsics_by_camera):
+        if not _update_annotation_payload(payload, new_intrinsics_by_sequence_camera):
             continue
         changed_files += 1
         if not dry_run:
@@ -239,12 +316,12 @@ def _update_annotations(
         path = anno_dir / name
         if not path.is_file():
             continue
-        needs_update = _update_json_manifest(path, cameras, dry_run=True)
+        needs_update = _update_json_manifest(path, sequence_cameras, dry_run=True)
         if needs_update:
             changed_files += 1
             if not dry_run:
                 _backup_metadata_file(uma_vi_dir, path, origin_dir_name)
-                _update_json_manifest(path, cameras, dry_run=False)
+                _update_json_manifest(path, sequence_cameras, dry_run=False)
 
     return changed_files
 
@@ -270,9 +347,10 @@ def process_uma_vi(
         "metadata_files": 0,
         "repaired_backups": 0,
     }
-    last_intrinsics_by_camera: dict[str, np.ndarray] = {}
+    new_intrinsics_by_sequence_camera: dict[tuple[str, str], np.ndarray] = {}
 
     for sequence_dir in _discover_sequences(uma_vi_dir):
+        sequence_name = sequence_dir.relative_to(uma_vi_dir).as_posix()
         stats["sequences"] += 1
         for camera_name in cameras:
             sensor_path = sequence_dir / "mav0" / camera_name / "sensor.yaml"
@@ -310,7 +388,9 @@ def process_uma_vi(
                 stats["processed_images"] += 1
 
             if new_intrinsics is not None:
-                last_intrinsics_by_camera[camera_name] = new_intrinsics
+                new_intrinsics_by_sequence_camera[(sequence_name, camera_name)] = (
+                    new_intrinsics
+                )
                 _update_sensor_yaml(
                     uma_vi_dir=uma_vi_dir,
                     sensor_path=sensor_path,
@@ -319,10 +399,10 @@ def process_uma_vi(
                     dry_run=dry_run,
                 )
 
-    if last_intrinsics_by_camera:
+    if new_intrinsics_by_sequence_camera:
         stats["metadata_files"] = _update_annotations(
             uma_vi_dir=uma_vi_dir,
-            new_intrinsics_by_camera=last_intrinsics_by_camera,
+            new_intrinsics_by_sequence_camera=new_intrinsics_by_sequence_camera,
             origin_dir_name=origin_dir_name,
             dry_run=dry_run,
         )

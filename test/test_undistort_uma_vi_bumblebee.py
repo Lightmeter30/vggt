@@ -11,23 +11,29 @@ import yaml
 from training.data.preprocess.undistort_uma_vi_bumblebee import process_uma_vi
 
 
-def _write_image(path: Path, value: int) -> None:
+def _write_image(path: Path, value: int, size: tuple[int, int] = (24, 32)) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    image = np.full((24, 32, 3), value, dtype=np.uint8)
-    image[:, :16, 0] = value // 2
+    height, width = size
+    image = np.full((height, width, 3), value, dtype=np.uint8)
+    image[:, : width // 2, 0] = value // 2
     assert cv2.imwrite(str(path), image)
 
 
-def _write_sensor(path: Path, distortion_model: str) -> None:
+def _write_sensor(
+    path: Path,
+    distortion_model: str,
+    intrinsics: list[float] | None = None,
+    resolution: list[int] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     sensor = {
         "sensor_type": "camera",
         "comment": "synthetic UMA camera",
         "T_BS": {"cols": 4, "rows": 4, "data": np.eye(4).reshape(-1).tolist()},
         "rate_hz": 10.0,
-        "resolution": [32, 24],
+        "resolution": resolution or [32, 24],
         "camera_model": "pinhole",
-        "intrinsics": [20.0, 20.5, 16.0, 12.0],
+        "intrinsics": intrinsics or [20.0, 20.5, 16.0, 12.0],
         "distortion_model": distortion_model,
         "distortion_coefficients": [0.02, -0.005, 0.001, 0.0],
     }
@@ -38,6 +44,11 @@ def _write_sensor(path: Path, distortion_model: str) -> None:
 def _read_yaml(path: Path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def _intrinsics_matrix_from_sensor(sensor: dict) -> list[list[float]]:
+    fx, fy, cx, cy = sensor["intrinsics"]
+    return [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]]
 
 
 class TestUndistortUmaViBumblebee(unittest.TestCase):
@@ -68,6 +79,8 @@ class TestUndistortUmaViBumblebee(unittest.TestCase):
         }
         payload = {
             "uma_vi/class-eng_2019-02-07-14-14-09_Indoor/cam0": {
+                "sequence_name": "class-eng_2019-02-07-14-14-09_Indoor",
+                "sequence_path": "class-eng_2019-02-07-14-14-09_Indoor",
                 "camera_name": "cam0",
                 "sensor": sensor,
                 "frames": [],
@@ -181,6 +194,64 @@ class TestUndistortUmaViBumblebee(unittest.TestCase):
 
         repaired = cv2.imread(str(backup_path), cv2.IMREAD_COLOR)
         self.assertIsNotNone(repaired)
+
+    def test_updates_annotation_intrinsics_per_sequence_camera(self):
+        second_sequence = self.uma_dir / "warehouse_02"
+        raw_camera_dir = second_sequence / "cam0"
+        mav_camera_dir = second_sequence / "mav0" / "cam0"
+        _write_image(raw_camera_dir / "data" / "1.png", 120, size=(30, 40))
+        _write_sensor(
+            mav_camera_dir / "sensor.yaml",
+            "equidistant",
+            intrinsics=[35.0, 36.0, 20.0, 15.0],
+            resolution=[40, 30],
+        )
+        mav_camera_dir.mkdir(parents=True, exist_ok=True)
+        (mav_camera_dir / "data").symlink_to(Path("..") / ".." / "cam0" / "data")
+
+        second_sensor = {
+            "intrinsics": [[35.0, 0.0, 20.0], [0.0, 36.0, 15.0], [0.0, 0.0, 1.0]],
+            "distortion": [0.02, -0.005, 0.001, 0.0],
+            "undistorted_intrinsics": [[35.0, 0.0, 20.0], [0.0, 36.0, 15.0], [0.0, 0.0, 1.0]],
+            "image_size": [40, 30],
+            "distortion_model": "equidistant",
+        }
+        second_payload = {
+            "uma_vi/warehouse_02/cam0": {
+                "sequence_name": "warehouse_02",
+                "sequence_path": "warehouse_02",
+                "camera_name": "cam0",
+                "sensor": second_sensor,
+                "frames": [],
+                "imu_data": None,
+            }
+        }
+        with gzip.open(self.anno_dir / "warehouse_02.jgz", "wt", encoding="utf-8") as f:
+            json.dump(second_payload, f)
+
+        process_uma_vi(self.uma_dir, cameras=("cam0",))
+
+        first_sensor_yaml = _read_yaml(self.sequence_dir / "mav0" / "cam0" / "sensor.yaml")
+        second_sensor_yaml = _read_yaml(second_sequence / "mav0" / "cam0" / "sensor.yaml")
+        with gzip.open(self.anno_dir / f"{self.sequence_dir.name}.jgz", "rt", encoding="utf-8") as f:
+            first_annotation = json.load(f)
+        with gzip.open(self.anno_dir / "warehouse_02.jgz", "rt", encoding="utf-8") as f:
+            second_annotation = json.load(f)
+
+        first_annotation_sensor = first_annotation[f"uma_vi/{self.sequence_dir.name}/cam0"]["sensor"]
+        second_annotation_sensor = second_annotation["uma_vi/warehouse_02/cam0"]["sensor"]
+        self.assertEqual(
+            first_annotation_sensor["intrinsics"],
+            _intrinsics_matrix_from_sensor(first_sensor_yaml),
+        )
+        self.assertEqual(
+            second_annotation_sensor["intrinsics"],
+            _intrinsics_matrix_from_sensor(second_sensor_yaml),
+        )
+        self.assertNotEqual(
+            first_annotation_sensor["intrinsics"],
+            second_annotation_sensor["intrinsics"],
+        )
 
 
 if __name__ == "__main__":

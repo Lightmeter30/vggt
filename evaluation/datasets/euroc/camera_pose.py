@@ -218,16 +218,20 @@ def build_imu_window(
         & (target_timestamps <= float(window_timestamps[-1]))
     )
 
+    # 预计算 float64 时间轴，避免在 6 次 np.interp 调用中重复转换
+    window_ts_f64 = window_timestamps.astype(np.float64)
+    imu_gyro = imu_data["gyro"][left:right]
+    imu_accel = imu_data["accel"][left:right]
     for axis in range(3):
         gyro[:, axis] = np.interp(
             target_timestamps,
-            window_timestamps.astype(np.float64),
-            imu_data["gyro"][left:right, axis].astype(np.float64),
+            window_ts_f64,
+            imu_gyro[:, axis].astype(np.float64),
         ).astype(np.float32)
         accel[:, axis] = np.interp(
             target_timestamps,
-            window_timestamps.astype(np.float64),
-            imu_data["accel"][left:right, axis].astype(np.float64),
+            window_ts_f64,
+            imu_accel[:, axis].astype(np.float64),
         ).astype(np.float32)
 
     imu_window = _format_imu_features(gyro, accel, imu_feature_order)

@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 import torch
 import torch.nn as nn
+import pytest
 
 from vggt.models.vggt import VGGT
 
@@ -84,3 +85,18 @@ def test_vggt_encodes_imu_and_passes_motion_tokens_to_aggregator():
     assert model.aggregator.received_motion_tokens is output["motion_tokens"]
     assert model.aggregator.received_imu_fusion is model.imu_fusion
 
+
+def test_vggt_rejects_unsupported_fusion_insert_at():
+    with patch("vggt.models.vggt.Aggregator", TinyAggregator):
+        with pytest.raises(ValueError, match="Unsupported fusion.insert_at"):
+            VGGT(
+                img_size=14,
+                patch_size=14,
+                embed_dim=8,
+                enable_camera=False,
+                enable_depth=False,
+                enable_point=False,
+                enable_track=False,
+                imu={"enabled": True},
+                fusion={"enabled": True, "type": "film", "insert_at": "after_attention"},
+            )

@@ -39,10 +39,17 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             )
 
         fusion_enabled = bool(_config_get(fusion, "enabled", False))
+        self.imu_fusion_insert_at = None
         if fusion_enabled:
             fusion_type = str(_config_get(fusion, "type", "film"))
             if fusion_type != "film":
                 raise ValueError(f"Unsupported fusion type: {fusion_type}")
+            self.imu_fusion_insert_at = str(_config_get(fusion, "insert_at", "aggregator_input"))
+            if self.imu_fusion_insert_at != "aggregator_input":
+                raise ValueError(
+                    "Unsupported fusion.insert_at: "
+                    f"{self.imu_fusion_insert_at}. Only 'aggregator_input' is implemented."
+                )
             self.imu_fusion = VisualIMUFiLM(
                 embed_dim=embed_dim,
                 hidden_dim=_config_get(fusion, "hidden_dim", None),
@@ -100,12 +107,16 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         motion_risk = None
         if self.imu_encoder is not None:
             if imu_windows is None:
-                raise ValueError("imu.enabled=True requires imu_windows in VGGT.forward().")
-            if imu_windows.ndim == 3:
-                imu_windows = imu_windows.unsqueeze(0)
-            if imu_window_masks is not None and imu_window_masks.ndim == 2:
-                imu_window_masks = imu_window_masks.unsqueeze(0)
-            motion_tokens, motion_risk = self.imu_encoder(imu_windows, imu_window_masks)
+                # 非 IMU 评测数据集（co3d、realestate10k、realx3d 等）不提供
+                # IMU 数据，此时模型退化为纯视觉模式，跳过 IMU 编码与融合。
+                # 这允许加载 IMU 训练的 checkpoint 在纯视觉数据集上评测。
+                motion_tokens = None
+            else:
+                if imu_windows.ndim == 3:
+                    imu_windows = imu_windows.unsqueeze(0)
+                if imu_window_masks is not None and imu_window_masks.ndim == 2:
+                    imu_window_masks = imu_window_masks.unsqueeze(0)
+                motion_tokens, motion_risk = self.imu_encoder(imu_windows, imu_window_masks)
 
         aggregator_kwargs = {
             "motion_tokens": motion_tokens,

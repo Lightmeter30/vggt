@@ -174,10 +174,21 @@ class TestEvaluationModelLoading(unittest.TestCase):
             "imu_encoder.temporal_encoder.layers.0.self_attn.in_proj_weight": torch.empty(24, 8),
             "imu_encoder.temporal_encoder.layers.1.self_attn.in_proj_weight": torch.empty(24, 8),
             "imu_encoder.output_proj.weight": torch.empty(1024, 8),
-            "imu_fusion.gamma_net.0.weight": torch.empty(8, 1024),
+            "imu_fusion.film.1.weight": torch.empty(2048, 1024),
+        }
+        model_config = {
+            "imu": {
+                "enabled": True,
+                "input_dim": 6,
+                "hidden_dim": 8,
+                "num_layers": 2,
+                "num_heads": 4,
+                "dropout": 0.1,
+            },
+            "fusion": {"enabled": True, "type": "film", "hidden_dim": 2048},
         }
 
-        model = build_model_from_state_dict(state_dict)
+        model = build_model_from_state_dict(state_dict, model_config=model_config)
 
         self.assertTrue(model.imu_enabled)
         self.assertIsNotNone(model.imu_encoder)
@@ -187,6 +198,55 @@ class TestEvaluationModelLoading(unittest.TestCase):
         self.assertIsNone(model.point_head)
         self.assertIsNone(model.depth_head)
         self.assertIsNone(model.track_head)
+
+    def test_build_model_from_state_dict_uses_checkpoint_model_config_for_imu_film(self):
+        state_dict = {
+            "imu_encoder.input_proj.weight": torch.empty(16, 6),
+            "imu_encoder.temporal_encoder.layers.0.self_attn.in_proj_weight": torch.empty(48, 16),
+            "imu_encoder.output_proj.weight": torch.empty(1024, 16),
+            "imu_fusion.film.1.weight": torch.empty(24, 1024),
+            "imu_fusion.film.3.weight": torch.empty(2048, 24),
+        }
+        model_config = {
+            "imu": {
+                "enabled": True,
+                "input_dim": 6,
+                "hidden_dim": 16,
+                "num_layers": 1,
+                "num_heads": 8,
+                "dropout": 0.25,
+            },
+            "fusion": {
+                "enabled": True,
+                "type": "film",
+                "hidden_dim": 24,
+                "zero_init_gamma_scale": 0.5,
+                "zero_init_beta_scale": 0.25,
+                "insert_at": "aggregator_input",
+            },
+        }
+
+        model = build_model_from_state_dict(state_dict, model_config=model_config)
+
+        encoder_layer = model.imu_encoder.temporal_encoder.layers[0]
+        self.assertEqual(encoder_layer.self_attn.num_heads, 8)
+        self.assertEqual(encoder_layer.dropout.p, 0.25)
+        self.assertEqual(model.imu_fusion.film[1].out_features, 24)
+        self.assertEqual(model.imu_fusion.zero_init_gamma_scale, 0.5)
+        self.assertEqual(model.imu_fusion.zero_init_beta_scale, 0.25)
+        self.assertEqual(model.imu_fusion_insert_at, "aggregator_input")
+
+    def test_build_model_from_state_dict_rejects_imu_checkpoint_without_model_config(self):
+        state_dict = {
+            "imu_encoder.input_proj.weight": torch.empty(16, 6),
+            "imu_encoder.temporal_encoder.layers.0.self_attn.in_proj_weight": torch.empty(48, 16),
+            "imu_encoder.output_proj.weight": torch.empty(1024, 16),
+            "imu_fusion.film.1.weight": torch.empty(24, 1024),
+            "imu_fusion.film.3.weight": torch.empty(2048, 24),
+        }
+
+        with self.assertRaisesRegex(ValueError, "model_config"):
+            build_model_from_state_dict(state_dict)
 
 
 class TestEurocCameraPoseEvaluation(unittest.TestCase):

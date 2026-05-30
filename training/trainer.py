@@ -33,6 +33,7 @@ import torch.nn as nn
 import torchvision
 from hydra.utils import instantiate
 from iopath.common.file_io import g_pathmgr
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from train_utils.checkpoint import DDPCheckpointSaver
 from train_utils.distributed import get_machine_local_and_dist_rank
@@ -56,6 +57,19 @@ class Trainer:
     """
 
     EPSILON = 1e-8
+
+    @staticmethod
+    def _to_plain_config(config):
+        if isinstance(config, (DictConfig, ListConfig)):
+            return OmegaConf.to_container(config, resolve=True)
+        if isinstance(config, Mapping):
+            return {
+                key: Trainer._to_plain_config(value)
+                for key, value in config.items()
+            }
+        if isinstance(config, Sequence) and not isinstance(config, (str, bytes)):
+            return [Trainer._to_plain_config(value) for value in config]
+        return config
 
     def __init__(
         self,
@@ -345,9 +359,12 @@ class Trainer:
 
         if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
             model = self.model.module
+        else:
+            model = self.model
 
         saver.save_checkpoint(
             model=model,
+            model_config=self._to_plain_config(self.model_conf),
             ema_models = None,
             skip_saving_parameters=[],
             **checkpoint_content,

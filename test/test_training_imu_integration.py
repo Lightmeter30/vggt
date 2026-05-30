@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
+from omegaconf import OmegaConf
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -12,6 +13,7 @@ if str(TRAINING_ROOT) not in sys.path:
     sys.path.insert(0, str(TRAINING_ROOT))
 
 from trainer import Trainer
+from train_utils.checkpoint import DDPCheckpointSaver
 
 
 class RecordingModel(nn.Module):
@@ -75,6 +77,56 @@ def test_load_checkpoint_in_val_mode_ignores_optimizer_state(tmp_path):
 
     assert trainer.steps == {"train": 5, "val": 0}
     assert trainer.ckpt_time_elapsed == 12.0
+
+
+def test_checkpoint_saver_writes_model_config_metadata(tmp_path):
+    model = nn.Linear(1, 1)
+    model_config = {
+        "imu": {"enabled": True, "num_heads": 8, "dropout": 0.25},
+        "fusion": {"enabled": True, "type": "film", "hidden_dim": 24},
+    }
+    saver = DDPCheckpointSaver(
+        checkpoint_folder=str(tmp_path),
+        checkpoint_names=["checkpoint"],
+        rank=0,
+        epoch=3,
+    )
+
+    saver.save_checkpoint(model=model, model_config=model_config, steps={"train": 1})
+
+    checkpoint = torch.load(tmp_path / "checkpoint.pt", map_location="cpu")
+    assert checkpoint["model_config"] == model_config
+
+
+def test_trainer_save_checkpoint_includes_plain_model_config(tmp_path):
+    trainer = object.__new__(Trainer)
+    trainer.checkpoint_conf = SimpleNamespace(
+        save_dir=str(tmp_path),
+        save_freq=0,
+    )
+    trainer.steps = {"train": 2, "val": 1}
+    trainer.time_elapsed_meter = SimpleNamespace(val=4.0)
+    trainer.optims = []
+    trainer.optim_conf = SimpleNamespace(amp=SimpleNamespace(enabled=False))
+    trainer.distributed_rank = 0
+    trainer.model = nn.Linear(1, 1)
+    trainer.model_conf = OmegaConf.create(
+        {
+            "_target_": "vggt.models.vggt.VGGT",
+            "enable_camera": True,
+            "enable_depth": False,
+            "enable_point": False,
+            "enable_track": False,
+            "imu": {"enabled": True, "num_heads": 8, "dropout": 0.25},
+            "fusion": {"enabled": True, "type": "film", "hidden_dim": 24},
+        }
+    )
+
+    trainer.save_checkpoint(epoch=3, checkpoint_names=["checkpoint"])
+
+    checkpoint = torch.load(tmp_path / "checkpoint.pt", map_location="cpu")
+    assert checkpoint["model_config"]["imu"]["num_heads"] == 8
+    assert checkpoint["model_config"]["fusion"]["hidden_dim"] == 24
 
 
 def test_update_scalars_logs_objective_as_loss_objective():
